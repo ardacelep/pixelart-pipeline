@@ -1,0 +1,8 @@
+# Cekirdek — tum sprite araclari (cikarim, bolme, paketleme, izgara
+# referansi, palet, sezgisel iskelet) yalnizca bu ikisini kullanir.
+numpy
+pillow
+
+# PixelLab API araclari: pixellab_karakter, pixellab_generate,
+# pixellab_dondur, pixellab_etiketle, pose_dataset
+requests

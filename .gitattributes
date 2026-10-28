@@ -1,0 +1,8 @@
+# Metin dosyalarinda satir sonlarini normalize et
+* text=auto eol=lf
+# Sprite sheet'ler ikili dosya — diff/merge denenmesin
+*.png binary
+*.gif binary
+# Model checkpoint'leri LFS'e. Desen models/*.pt degil *.pt: alt klasordeki
+# bir checkpoint sessizce ham blob olarak git'e girmesin.
+*.pt filter=lfs diff=lfs merge=lfs -text

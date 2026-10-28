@@ -1,0 +1,11 @@
+# Poz modeli (pose_model.py: egitim + eval) ve model destekli etiketleme.
+# Bu dosyayi sistem python'una KURMAK ZORUNDA DEGILSINIZ — araclar torch'u
+# tembel import eder ve yoksa sezgisel iskelete duser. Mevcut bir ComfyUI
+# venv'i varsa en kolayi onu kullanmak:
+#     ~/ComfyUI/venv/bin/python tools/pose_model.py eval ...
+torch
+torchvision
+safetensors
+
+# chen_to_pixelart.py'nin pikselizasyon adimi
+pixeloe

@@ -1,0 +1,933 @@
+# Gemini Prompt Rehberi
+
+Karakter ve animasyon üretirken kullanılacak prompt'lar. Her kısıtın **neden** orada olduğu yazılı — çünkü Gemini uzun prompt'ların bir kısmını görmezden geliyor, hangilerinin taviz verilebilir olduğunu bilmek gerekiyor.
+
+Araçların ne yaptığı: [README](README.md#araç-dizini).
+
+## Hangi kısıt gerçekten kritik?
+
+| Kısıt | Neden | Araç düzeltebilir mi |
+| --- | --- | --- |
+| Tüm sheet **tek bir piksel ızgarasında** çizilmiş olmalı | `pixelart_extract` sheet'in tamamında tek kafes varsayıyor | ✗ |
+| Karakterin **ölçeği tüm karelerde aynı** olmalı | Ölçek farkını düzeltmenin tek yolu yeniden örneklemek, yani piksel sanatını bozmak | ✗ |
+| Kareler arasında **tamamen boş şerit** olmalı | `split_sheet` kareleri boş satır/sütundan ayırıyor | ✗ |
+| **Çerçeve, kare numarası, etiket, yer gölgesi yok** | Hepsi opak piksel; kareye yapışır ya da bölmeyi bozar | ✗ |
+| Dama rengi karakterde **hiç bulunmayan** bir renk olmalı | Ölçüldü: gri damada saf beyaz karakter pikselleri yeniyor, magenta damada yenmiyor | kısmen |
+| Blok kenarları **keskin** olmalı, yeniden sıkıştırma olmamalı | Yeterince bozulmuş bir render'da ızgara hiç bulunamıyor ve `pixelart_extract` hata verip duruyor | ✗ |
+| Filigranın **karakterin üstüne gelmemesi** | Engellenemiyor; prompt'ta konuyu açmak durumu kötüleştiriyor. Tek çare düzende sağ alt hücreyi boş bırakmak | ✗ |
+| Karakter **dış kenara değmemeli** | Dama tonları tam o kenar şeridinden öğreniliyor; değerse karakterin konturu "dama tonu" sanılıyor | ✗ |
+| Karakterin canvas'ta ortalı olması | `pack_sheet` zaten içerikten hizalıyor | ✓ |
+| Kareler arası aynı taban çizgisi | `pack_sheet` ayak çizgisine hizalıyor | ✓ |
+| Kareler arası boşluk miktarı | Kırpma ve hizalama hallediyor | ✓ |
+| Beyaz/krem kıyafet yasağı | Magenta damayla ölçülen kayıp sıfır — kısıt artık gereksiz | ✓ |
+
+Yani prompt'ta yer alması gereken şey, üstteki sekiz satır. Alttaki dördü eskiden zorunluydu, artık değil; "canvas'ın %85'ini doldurmalı" ya da "beyaz ayakkabı kullanma" gibi maddeleri prompt'a koymak sadece Gemini'nin dikkatini dağıtır.
+
+## Dama rengi: gri değil, magenta
+
+Eski rehber **açık tonlu** dama istiyordu (`#FFFFFF` / `#E0E0E0`); o, eski script nötr gri beklediği için doğruydu. `pixelart_extract` dama rengini kenardan ölçerek buluyor, dolayısıyla artık tersi geçerli: dama, karakterin paletinde **asla bulunmayacak** bir renk olmalı.
+
+Ölçüm (saf beyaz içeren bir karakterle):
+
+| Dama | Arka plan kalıntısı | Yenen karakter pikseli |
+| --- | --- | --- |
+| `#ffffff` / `#e1e1e1` | 0 | 1 |
+| `#ff00ff` / `#c000c0` | 0 | 0 |
+| `#b4f0c8` / `#8cd8a8` | 0 | 0 |
+
+Yan fayda: `--fill-gaps` güvenli hale geliyor. Gri damada göz akı (254-255) damanın açık tonundan (253) ayırt edilemiyor ve boşluklarla birlikte siliniyor; magenta damada göz akı damaya 300 birim uzak, yani hiçbir zaman aday olmuyor.
+
+İkinci fayda tolerans payında. Ölçülen bir magenta render'da dama tonları `(184,0,184)` ve `(254,1,252)`, dama karelerinin sınırındaki karışım pikselleri ise `(210,0,211)` — tonlara 27 birim uzak. Magenta damada 36 birimlik tolerans rahatça güvenliyken gri damada 4 bile riskli, çünkü güvenli tolerans tamamen damanın karakter paletine uzaklığına bağlı.
+
+## Render keskinliği: kurtarılamayan tek kusur
+
+Prompt'taki en kolay gözden kaçan teknik madde bu. Diğer kusurların çoğunu araçlar telafi ediyor; yeniden sıkıştırılmış bir render'ı hiçbir şey telafi etmiyor.
+
+`pixelart_extract` önce "bu görsel zaten native mi, yoksa büyütülmüş mü?" diye soruyor. Ölçüt, komşu satır/sütun farklarının biçimi: büyütülmüş pixel art'ta dağılım iki tepeli (blok içi farklar küçük, blok sınırları büyük), native görselde tek tepeli. 53 gerçek dosyada ölçülen aralıklar — büyütülmüş pixel art 0.14–0.29, **ağır yeniden kodlanmış sheet'ler 0.56–0.59**, native pixel art 0.77–1.24, illüstrasyon/fotoğraf 0.86–0.99. Eşik 0.70.
+
+Yani yeniden kodlama görseli tam da karar sınırına doğru itiyor: blok içi gürültü arttıkça görsel giderek "native" gibi görünüyor.
+
+Ölçülen gerçek örnek, 5632×704'lük bir yürüyüş sheet'i (171 700 ayrı renk): oran `(0.520, 0.558)`. Sınıflandırma doğru — büyütülmüş sayılıyor — ama bir sonraki adım tutmuyor:
+
+```
+HATA: X ekseninde izgara bulunamadi (en iyi oran 1.40, esik 3.0)
+      — gorsel buyutulmus pixel art olmayabilir ya da render cok bozuk olabilir.
+```
+
+Bu iyi haber: araç sessizce bozuk çıktı vermek yerine duruyor. Ama dosya yine de kurtarılamıyor — tek çare yeniden ürettirmek.
+
+Pratikte: **çıktı PNG olarak alınmalı**, JPEG'e çevrilmemeli, "enhance"/upscale filtresinden geçirilmemeli, ekran görüntüsüyle yeniden kaydedilmemeli. Blok kenarlarında ara ton olmamalı.
+
+Kontrol etmenin en hızlı yolu, `pixelart_extract`'in bildirdiği native çözünürlük: 2048'lik bir canvas'tan 100×100 civarı bekliyorsanız ve araç size girdiyle aynı ölçüyü söylüyorsa ya da ızgarayı hiç bulamıyorsa, render bozuktur.
+
+### Kusur renk gürültüsü değil, kafes kayması
+
+Sezgi "sıkıştırma gürültüsü" der ama ölçüm başka şey gösterdi. Başarısız bir sheet 32 renge indirgendiğinde bile ızgara skoru 1.71'de kaldı (eşik 3.0) — yani sorun renk sayısı değil.
+
+Asıl ölçüt blok sınırlarının **fazı**: bütün sınırlar aynı kafese mi oturuyor? İki sheet aynı ızgara referansından üretildi, dama deseni ikisinde de birebir aynı (57px kare), ama:
+
+| | ızgara skoru | sınır fazlarının toplanması |
+| --- | --- | --- |
+| Çalışan sheet | 93.17 | 0.989 — sınırların %99'u tek fazda |
+| Bozuk sheet | 1.78 | 0.170 — sınırlar on dilime dağılmış |
+
+Yani arka planın düzenli olması yetmiyor; **karakterin** blok kenarlarının hepsi tek bir kafese oturmalı. Bozuk örnekte karakter, kenarları piksel ızgarasına oturtulmadan çizilmişti — çizgili gömlek gibi ince desenler bu riski artırıyor.
+
+### En sinsi kusur: satırdan satıra ölçek kayması
+
+Ölçülen bir sheet'te ızgaranın **her satırı farklı piksel ölçeğinde** çizilmişti:
+
+| Izgara satırı | Blok | Karakterin native boyu |
+| --- | --- | --- |
+| 1 | 8.67px | 70px |
+| 2 | ~8.0px | 77px |
+| 3 | ~7.3px | 83px |
+
+Karakterlerin ekrandaki boyu hepsinde aynıydı (~605px) — değişen şey piksel yoğunluğuydu. Bu yüzden göze hiçbir şey batmıyor; sheet gayet düzgün görünüyor.
+
+Ama tüm sheet için **tek bir kafes yok**. Global tespit haklı olarak reddediyor, tek periyot zorlanınca da üç satırın ikisi yanlış örnekleniyor: gözler lekeye dönüyor, ince desenler tırtıklanıyor.
+
+Çare `--per-frame`: kareler önce ayrılıyor, her birinde ayrı kafes aranıyor (ölçüldü: her karede %100 uyum), sonra hepsi ortak bir native boya indiriliyor.
+
+```bash
+python3 tools/pixelart_extract.py sheet.png native.png --per-frame --merge-colors 10
+```
+
+Hedef boy, kabul edilebilirlerin **en küçüğü**: büyütmek piksel uydurur ve tam da kaçındığımız düzensiz blokları üretir; küçültmek mod örneklemedir, bilgi atar ama uydurmaz. Yine de kayıp gerçek — en iyisi sheet'i yeniden ürettirmek.
+
+### Kurtarma: `--period`
+
+Düzen biliniyorsa (elinizde native karakter varsa) periyodu elle verebilirsiniz; hücre içi **mod** alındığı için kafes birebir oturmasa da kullanılabilir sonuç çıkıyor:
+
+```bash
+python3 tools/pixelart_extract.py sheet.png native.png --period 7.136 --merge-colors 12
+```
+
+Periyot = sheet'teki karakter yüksekliği / native karakter yüksekliği. Bu bir onarım değil, mecburiyet çözümü: sonuç ölçülebilir şekilde daha gürültülü olur. Şansınız varsa yeniden ürettirin.
+
+## Düzen: ızgara, tek sıra değil
+
+**Kareleri tek sırada yan yana istemeyin.** 8 kare tek sırada = 8:1 en-boy oranı; bu kadar uzun bir görsel elinize gelene kadar yeniden ölçeklenip sıkıştırılıyor ve piksel ızgarası bunu kaldırmıyor. Ölçülen gerçek bir örnek: 5632×704'lük bir yürüyüş sheet'i **171 700 ayrı renkle** geldi (temiz bir render'da birkaç yüz renk olur) ve ızgara tespiti tamamen başarısız oldu — `pixelart_extract` "X ekseninde izgara bulunamadi" deyip durdu. Dosya kurtarılamadı, yeniden ürettirmek gerekti.
+
+Çare, aynı kareleri ızgaraya dizmek — canvas kareye yakın kalıyor:
+
+| Kare sayısı | İstenecek düzen | Canvas |
+| --- | --- | --- |
+| 4 | 2 satır × 2 sütun | kare |
+| 6 | 2 satır × 3 sütun | kareye yakın |
+| 8 | 2 satır × 4 sütun | 2:1 |
+| 9 | 3 satır × 3 sütun | kare |
+
+Gemini kare canvas'ta daha tutarlı çalışıyor; dikey/portre canvas istendiğinde karakteri sıkıştırıp ölçeği kareler arasında oynatıyor. `split_sheet.py` R×C ızgarayı zaten destekliyor (ölçüldü: 2×4 ızgara, 8 kare, okuma sırası korunuyor), o yüzden ızgara istemenin bizim tarafta hiçbir maliyeti yok.
+
+Motorun beklediği **yatay şerit** endişe konusu değil: onu `pack_sheet` üretiyor ve o dosya küçük olduğu için (ör. 256×32) sıkıştırma sorunu yaşamıyor. Izgara yalnızca Gemini'den ALIRKEN gerekli.
+
+**Bunun bedeli çözünürlük.** Tek kare üretiminde 2048'lik canvas'tan ~95 piksel boyunda karakter çıkıyor; 2×2 ızgarada her kareye 1024 düşüyor, yani yaklaşık yarısı. Karşılığında kareler **birbiriyle tutarlı** oluyor — kareleri tek tek ürettirmenin en büyük sorunu buydu: her üretim karakteri biraz farklı ölçekte çiziyor ve ölçek farkını araç düzeltemiyor. Detay mı tutarlılık mı sorusunun cevabı karaktere göre değişir; ikisini de deneyip `pixelart_extract`'in bildirdiği native çözünürlüğe bakın.
+
+---
+
+## 1. Temel karakter (buradan başlayın)
+
+Her şeyin referansı bu görsel: walk ve idle sheet'leri buna bakarak üretiliyor, dolayısıyla buradaki bir hata sonraki her adıma taşınıyor. Fotoğraftan üretiyorsanız **8-10 fotoğrafı birlikte** verin — tek fotoğrafla üretilen karakterin kimliği (saç, gözlük, kıyafet tercihi) kareler arasında oynuyor.
+
+```
+Sana bu kişinin 8-10 farklı fotoğrafını veriyorum. Bunları tek tek değil, BİRLİKTE
+analiz ederek tutarlı bir karakteristik profil çıkar, sonra bu profile göre tam
+vücut bir pixel art karakter üret.
+
+ADIM 1 — ANALİZ
+Tüm fotoğrafları karşılaştırarak, farklı açı/ışık/ifadelerde bile DEĞİŞMEYEN,
+kişiyi tanımlayan özellikleri belirle:
+- Saç rengi, uzunluğu ve modeli
+- Yüz yapısı: gözlük var mı, sakal/bıyık modeli
+- Genel vücut yapısı (uzun/kısa, ince/dolgun)
+- Fotoğraflarda tekrar eden kıyafet tarzı veya renk tercihi
+- Sabit aksesuarlar (gözlük modeli, küpe, saat, yaka kartı)
+Çelişen detaylarda en sık tekrar edeni ya da en ayırt edici olanı seç.
+
+ADIM 2 — KARAKTER
+- Poz: tam vücut, ÖNDEN görünüm, ayakta, nötr duruş. Kollar gövdenin yanında.
+- Stil: chunky/blocky 16-bit oyun karakteri estetiği, basitleştirilmiş detaylar.
+- Orantı: chibi, 2-3 baş boyu (büyük kafa, küçük gövde).
+- Palet: 16-24 renk, net koyu kontur.
+- Fotoğraftaki en belirgin 2-3 özelliği abartarak/stilize ederek yansıt.
+- İki ayak da AYNI yatay çizgiye otursun.
+
+ARKA PLAN — DAMA DESENİ
+- Şeffaflığı göstermek için dama (checkerboard) deseni kullan; renkleri TAM OLARAK
+  #FF00FF ve #C000C0 olsun.
+- Bu iki magenta tonu karakterin HİÇBİR yerinde kullanılmamalı.
+- Dama tüm görsel boyunca AYNI iki renkte kalsın: gradyan, gölge, vinyet, ışık
+  kayması ya da renk kayması EKLEME.
+- Dama karesinin kenarı, karakterin piksel bloğunun tam katı olsun (örneğin bir
+  dama karesi = 2 piksel bloğu) ve dama karakterle AYNI ızgaraya hizalansın.
+
+RENDER KESKİNLİĞİ — EN KRİTİK TEKNİK MADDE
+- Gerçek pixel art: her piksel bloğu TEK bir düz renk, kenarları keskin.
+- Anti-aliasing, yumuşak geçiş, gradyan, bulanıklık, yumuşak gölge ya da yarı
+  saydam piksel YOK. Blok kenarlarında ara ton olmayacak.
+- Tüm görsel TEK bir piksel ızgarasında çizilsin; blok boyutu her yerde aynı.
+- Çıktı PNG olsun. JPEG'e çevirme, yeniden sıkıştırma, "enhance"/upscale ya da
+  keskinleştirme filtresi uygulama.
+
+GÖRSELDE BULUNMAYACAKLAR
+- Yer gölgesi, zemin çizgisi, platform, yansıma.
+- Çerçeve, kenarlık, başlık, etiket, yazı, renk paleti şeridi.
+- Karakterden KOPUK hiçbir parça olmasın; silüet tek parça olsun.
+
+- Kolla gövde arasında 1-2 piksellik minik boşluklar bırakma: kol ya gövdeye
+  değsin ya da arada en az 4 piksellik net bir açıklık olsun.
+
+Canvas kare (1:1) ve olabilecek en yüksek çözünürlükte olsun.
+Çıktıyı PNG olarak ver.
+```
+
+Bu prompt'ta **kasıtlı olarak bulunmayan** iki eski madde var. "Karakter canvas'ın en az %85'ini doldursun" gereksiz: `pixelart_extract` kenar boşluğunu kırpıyor, `pack_sheet` de hizalıyor. "Beyaz/krem kıyafet kullanma" da gereksiz: o kısıt gri damanın beyaz pikselleri yemesi yüzünden vardı, magenta damayla ölçülen kayıp sıfır. İkisini de prompt'a geri koymak Gemini'nin dikkatini gerçekten kritik olan maddelerden dağıtıyor.
+
+Karakteri işleyip `characters/` altına koymak için: [README](README.md#boru-hattı).
+
+---
+
+## 2. Walk cycle spritesheet — sıfırdan (4 kare, 2×2)
+
+Gemini'nin yürüyüş döngüsünü sıfırdan tutturması zor; bu prompt bir deneme değeri taşıyor ama sonuç tatmin etmezse [3. bölümdeki](#3-hazır-sheet-üzerinde-karakter-değiştirme-walk-için-önerilen-yol) poz-referanslı yöntem belirgin şekilde daha güvenilir.
+
+```
+Ekteki pixel art karakteri referans alarak, YÜRÜME animasyonunun 4 karesini TEK bir
+görselde, 2x2 ızgara halinde üret.
+
+YERLEŞİM
+- Kare canvas (1:1), olabilecek en yüksek çözünürlükte.
+- 2 satır x 2 sütun. Okuma sırası: sol üst = 1. kare, sağ üst = 2. kare,
+  sol alt = 3. kare, sağ alt = 4. kare.
+- Kareler arasında ve ızgaranın dışında, KARAKTERE AİT HİÇBİR PİKSEL BULUNMAYAN,
+  tamamen arka plan olan boş şeritler bırak. Şerit genişliği bir karenin en az
+  onda biri kadar olsun.
+- Çerçeve, ayırıcı çizgi, kare numarası, etiket, başlık ya da yazı EKLEME.
+- Karakterin altına yer gölgesi ya da zemin çizgisi ÇİZME. Karakter dışında hiçbir
+  şey olmayacak.
+
+ARKA PLAN
+- Şeffaflığı göstermek için dama (checkerboard) deseni kullan; renkleri tam olarak
+  #FF00FF ve #C000C0 (magenta) olsun.
+- Bu iki renk karakterin hiçbir yerinde KULLANILMAMALI.
+- Dama deseni tüm görsel boyunca AYNI iki renkte kalsın; gölge, gradyan, vinyet
+  ya da renk kayması ekleme.
+
+ÖLÇEK — EN KRİTİK MADDE
+- Karakterin ölçeği dört karede de BİREBİR aynı olmalı: kafa yüksekliği, gövde
+  genişliği, bacak uzunluğu, gözlük boyutu — hepsi aynı sayıda piksel.
+- Değişen tek şey uzuvların POZİSYONU olacak. Karakteri kareler arasında
+  büyütme, küçültme, yakınlaştırma.
+- Tüm sheet aynı piksel ızgarasında çizilsin: bir karedeki "piksel" bloğu ile
+  diğerindeki aynı boyutta olmalı.
+
+POZLAR (yandan görünüm, karakter SAĞA bakıyor)
+Her kareyi aşağıdaki gibi, mutlak olarak çiz. "Öncekinin aynası" diye düşünme,
+her kareyi sıfırdan tarif edildiği gibi çiz.
+
+1. kare — Temas: Sağ bacak (izleyiciye yakın olan, açık tonlu) öne uzanmış,
+   topuk yere değiyor. Sol bacak (uzak olan, koyu tonlu) geride, parmak ucunda.
+   Sağ kol geride, sol kol önde.
+2. kare — Geçiş: Sağ bacak dikey, tüm ağırlık onda, yere tam basıyor. Sol bacak
+   dizden bükülü, ayak yerden kalkmış, sağ bacağın yanından geçiyor. Gövde en
+   yüksek noktada. Kollar gövdenin yanında, neredeyse dikey.
+3. kare — Temas: Sol bacak (uzak olan, koyu tonlu) öne uzanmış, topuk yere
+   değiyor. Sağ bacak (yakın olan, açık tonlu) geride, parmak ucunda.
+   Sol kol geride, sağ kol önde.
+4. kare — Geçiş: Sol bacak dikey, tüm ağırlık onda. Sağ bacak dizden bükülü,
+   ayak yerden kalkmış, sol bacağın yanından geçiyor. Gövde en yüksek noktada.
+   Kollar gövdenin yanında.
+
+Uzak taraftaki kol ve bacağı biraz daha koyu tonda çiz ki hangi uzvun önde
+olduğu anlaşılsın.
+
+ÇİZİM KURALLARI
+- Gerçek pixel art: her piksel bloğu tek düz renk, kenarları keskin. Yumuşak
+  geçiş, anti-aliasing, gradyan, bulanıklık ya da yarı saydam piksel YOK.
+- Çıktı PNG olsun. JPEG'e çevirme, yeniden sıkıştırma, "enhance"/upscale ya da
+  keskinleştirme filtresi uygulama.
+- Sınırlı palet (16-24 renk), net koyu kontur.
+- Karakterin tasarımı (saç, gözlük, sakal, kıyafet, aksesuarlar, renkler)
+  referanstakiyle birebir aynı kalmalı.
+- Kolla gövde arasında 1-2 piksellik minik boşluklar bırakma: kol ya gövdeye
+  değsin ya da arasında en az 4 piksellik net bir açıklık olsun.
+
+Çıktıyı yüksek çözünürlüklü PNG olarak ver.
+```
+
+## 3. Hazır sheet üzerinde karakter değiştirme (walk için önerilen yol)
+
+Sıfırdan walk cycle üretimi Gemini'de güvenilir değil: model ayna-simetrik pozları tutturamıyor, çoğu denemede aynı pozu tekrarlıyor. Çalışan yol, **pozu üretmeyi modelden almak** — animasyonu doğru olan hazır bir sheet'i poz referansı verip yalnızca karakteri değiştirtmek.
+
+Buradaki karakter referansını **sağa bakan** halde vermek işi kolaylaştırıyor: önden bir referans verirseniz modelden aynı anda hem döndürmesini hem poz vermesini istemiş olursunuz. Önce [5. bölümdeki](#5-karakteri-sağa-çevirme-önden--yandan) döndürme prompt'unu çalıştırın.
+
+### Önce referansı ızgaraya çevirin
+
+Referansı **şerit** verip çıktıyı **ızgara** istemek ölçülebilir şekilde kötü sonuç veriyor: model aynı anda hem yeniden dizmek hem karakter değiştirmek zorunda kalıyor ve poza ayırdığı dikkat azalıyor — bir denemede alt satırdaki dört kare birbirinin neredeyse aynısı çıktı. Referansı zaten istediğiniz düzende verin, o yükü ortadan kaldırın:
+
+```bash
+python3 tools/grid_ref.py characters/ael/walk_right_spritesheet.png -o izgara_referans.png
+```
+
+Araç üç şeyi birden hallediyor: kareleri ızgaraya diziyor, magenta damayı çiziyor ve **sağ alt hücreyi boş bırakıyor** (nedeni aşağıda). 8 kare için 3×3 seçiyor, dokuzuncu hücre boş kalıyor.
+
+### Filigran: konuyu hiç açmayın
+
+Gemini köşeye parıltı (✦) işaretini koyuyor ve bu **engellenemiyor**. Ölçülen bir üretimde tam karakterin şortunun üzerine geldi; orada kurtarılamaz, çünkü kopuk olmadığı için leke temizliği yakalayamıyor ve rengi karakterin gri tonlarıyla aynı ailede olduğu için renk ölçütü de ayırt edemiyor.
+
+Prompt'ta filigrandan **hiç söz etmeyin** — ne yasak olarak, ne de "gerekiyorsa şuraya koy" diye. İkisi de denendi ve ikisi de ters tepti: yasaklayınca yine koydu, yer gösterince köşeye fazladan siyah damalı bir işaret daha ekledi (o işaret hem sağ hem alt kenara değiyordu, yani dama tonu öğrenmeyi de bozuyordu). Konuyu açmak modelin dikkatini oraya çekiyor.
+
+Çare tamamen düzende: sağ alt hücre boş bırakılıyor, işaret oraya düşüyor ve çıkarımda zararsız kalıyor. `grid_ref.py` bunu kendiliğinden yapıyor, prompt'ta tek kelime etmeye gerek yok.
+
+### Dış kenar payı da şart
+
+Kareler arasındaki boşluk yetmiyor, **ızgaranın dışında da** pay gerekiyor. Ölçüldü: bir Gemini çıktısında karakterlerin ayakları tuvalin alt kenarına değiyordu (alt 8 piksellik şeridin %28'i karakter). `pixelart_extract` dama tonlarını tam o kenar şeridinden öğrendiği için ayakkabı konturu `#000000` üçüncü bir "dama tonu" sanıldı, tolerans 3 yerine 60 seçildi ve karakter yendi — çıktı 26×15'e düştü. Alta pay eklenince aynı dosyada tonlar düzeldi.
+
+### Prompt
+
+```
+Sana İKİ referans veriyorum:
+  (A) POZ REFERANSI — animasyonu doğru olan, IZGARA düzeninde bir sprite sheet.
+  (B) KARAKTER REFERANSI — kullanmanı istediğim karakter.
+
+GÖREV
+(A)'daki her karenin POZUNU birebir koru, ama karakteri (B)'deki karakterle
+DEĞİŞTİR. Yani iskelet/hareket (A)'dan, görünüm (B)'den gelecek.
+
+- (A)'daki uzuv açıları, gövde eğimi, ayakların yere göre konumu, hangi karede
+  hangi bacağın önde olduğu — hepsi aynı kalacak.
+- (B)'deki saç, yüz, gözlük, sakal, kıyafet, aksesuarlar, renk paleti — hepsi
+  birebir taşınacak.
+- (A)'daki karakterin kıyafetinden, saç renginden, vücut oranından HİÇBİR ŞEY
+  sızmayacak. (A) yalnızca poz kaynağı.
+
+DÜZEN — (A) İLE BİREBİR AYNI
+- (A)'nın ızgara düzenini AYNEN koru: aynı satır sayısı, aynı sütun sayısı,
+  aynı kare sırası. Yeniden dizme, sıkıştırma, tek sıraya alma YOK.
+- (A)'da BOŞ olan hücreyi BOŞ BIRAK. Oraya kare koyma, karakter çizme.
+- Kareler arasındaki boşluklar ve ızgaranın DIŞINDAKİ kenar payı (A)'daki
+  kadar kalsın. Karakterin hiçbir pikseli tuvalin dış kenarına DEĞMESİN.
+- Canvas (A) ile aynı en-boy oranında olsun.
+- Çerçeve, ayırıcı çizgi, kare numarası, etiket ya da yazı EKLEME.
+
+ÖLÇEK — EN KRİTİK MADDE
+- Karakterin ölçeği bütün karelerde BİREBİR aynı olmalı: kafa yüksekliği, gövde
+  genişliği, bacak uzunluğu — hepsi aynı sayıda piksel.
+- Değişen tek şey uzuvların POZİSYONU. Kareler arasında büyütme, küçültme,
+  yakınlaştırma yok.
+- Tüm sheet aynı piksel ızgarasında çizilsin; bir karedeki piksel bloğu ile
+  diğerindeki aynı boyutta olmalı.
+- Karakter SAĞA baksın (sola yürüyüş bizde aynadan üretiliyor).
+
+ARKA PLAN
+- (A)'daki dama (checkerboard) desenini aynen koru: renkleri TAM OLARAK
+  #FF00FF ve #C000C0, kare boyutu da (A)'daki kadar.
+- DAMA SENİN CETVELİN: bir dama karesi TAM OLARAK 8 karakter pikseli
+  genişliğindedir. Karakterin her piksel bloğu bu ızgaraya oturmalı — blok
+  kenarları dama karelerinin kenarlarıyla hizalı olsun. Karakteri damadan
+  bağımsız, serbest elle çizme.
+- Bu iki magenta tonu karakterin HİÇBİR yerinde kullanılmamalı.
+- Dama tüm görsel boyunca AYNI iki renkte kalsın; gradyan, gölge, vinyet ya da
+  renk kayması EKLEME.
+
+ÇİZİM KURALLARI
+- Gerçek pixel art: her piksel bloğu TEK düz renk, kenarları keskin.
+- Anti-aliasing, yumuşak geçiş, gradyan, bulanıklık ya da yarı saydam piksel YOK.
+- Sınırlı palet (16-24 renk), net koyu kontur.
+- Uzak taraftaki kol ve bacağı biraz daha koyu tonda çiz ki hangi uzvun önde
+  olduğu anlaşılsın.
+- Kolla gövde arasında 1-2 piksellik minik boşluklar bırakma: kol ya gövdeye
+  değsin ya da arada en az 4 piksellik net açıklık olsun.
+- Yer gölgesi, zemin çizgisi ÇİZME.
+
+
+Çıktıyı PNG olarak ver. JPEG'e çevirme, yeniden sıkıştırma, "enhance"/upscale
+filtresi uygulama.
+```
+
+### Gelen dosyada kontrol edilecekler
+
+Kareler yapışık gelirse otomatik bölme çalışmaz; ızgara ölçüsünü elle verin (menüde 3. adımda "Kareler arasında boşluk var mı?" sorusuna hayır, ya da doğrudan):
+
+```bash
+python3 tools/split_sheet.py sheet_native.png -o kareler/ --rows 3 --cols 3 --preview bolme.png
+```
+
+Boş hücre kare sayısını bir fazla gösterir mi? Göstermez — boş hücrede opak piksel olmadığı için `split_sheet` onu kare saymaz. Ama filigran oraya düştüyse **sayar**; o zaman `--frames` ile beklenen sayıyı verip fazladan çıkanı silin.
+
+## 4. Idle spritesheet
+
+Idle için de en güvenilir yol poz referansı vermek. Sıfırdan üretim aşağıda ikinci seçenek olarak duruyor.
+
+### 4a. Hazır idle sheet üzerinde karakter değiştirme (önerilen)
+
+Walk ile aynı mantık, ama **bir tuzağı fazla var**: idle'da kareler arasındaki fark çok küçük. Ölçülen referansta nefes hareketi tam **1 piksel** — omuz hattı 1. karede y=7, diğer üçünde y=6; siluet farkları 35-101 piksel. Bu kadar ince bir farkı model kolayca "gürültü" sanıp dört kareyi birbirinin aynısı yapıyor. Prompt bu yüzden farkın korunmasını açıkça istiyor.
+
+```bash
+python3 tools/grid_ref.py characters/ael/idle_spritesheet.png -o idle_ref.png
+```
+
+4 kare için 2 satır × 3 sütun seçilir; iki hücre boş kalır, sonuncusu sağ altta (filigran oraya düşsün).
+
+```
+Sana İKİ referans veriyorum:
+  (A) POZ REFERANSI — idle (bekleme) animasyonu, IZGARA düzeninde.
+  (B) KARAKTER REFERANSI — kullanmanı istediğim karakter.
+
+GÖREV
+(A)'daki her karenin DURUŞUNU birebir koru, ama karakteri (B)'deki karakterle
+DEĞİŞTİR. Duruş/hareket (A)'dan, görünüm (B)'den gelecek.
+
+- (B)'deki saç, yüz, gözlük, sakal, kıyafet, aksesuarlar, renk paleti — hepsi
+  birebir taşınacak.
+- (A)'daki karakterin kıyafetinden, saç renginden, vücut oranından HİÇBİR ŞEY
+  sızmayacak. (A) yalnızca duruş kaynağı.
+
+EN KRİTİK MADDE — KARELER ARASI FARK ÇOK KÜÇÜK, KORU
+(A)'daki dört kare birbirine ÇOK benziyor; aralarındaki tek fark göğüs/omuz
+hattının 1 piksel oynaması. Bu fark animasyonun KENDİSİ, gürültü değil.
+- Dört kareyi birbirinin aynısı YAPMA.
+- Hangi karede omuz hattı yukarıdaysa senin çıktında da yukarıda olsun;
+  aşağıdaysa aşağıda. (A)'ya kare kare bakıp bu farkı taşı.
+- Farkı BÜYÜTME de: 1 piksellik oynama 1 piksel kalsın. Karakteri bütün
+  olarak büyütüp küçültme.
+- Ayakların konumu, bacaklar, kolların X konumu, kafanın boyutu, silüetin
+  genişliği dört karede de TEK PİKSEL bile oynamayacak.
+
+DÜZEN — (A) İLE BİREBİR AYNI
+- (A)'nın ızgara düzenini AYNEN koru: aynı satır sayısı, aynı sütun sayısı,
+  aynı kare sırası.
+- (A)'da BOŞ olan hücreleri BOŞ BIRAK. Oraya kare koyma, karakter çizme.
+- Kareler arasındaki boşluklar ve ızgaranın DIŞINDAKİ kenar payı (A)'daki
+  kadar kalsın. Karakterin hiçbir pikseli tuvalin dış kenarına DEĞMESİN.
+- Canvas (A) ile aynı en-boy oranında olsun.
+- Çerçeve, ayırıcı çizgi, kare numarası, etiket ya da yazı EKLEME.
+
+ÖLÇEK
+- Karakterin ölçeği bütün karelerde BİREBİR aynı olmalı: kafa yüksekliği,
+  gövde genişliği, bacak uzunluğu — hepsi aynı sayıda piksel.
+- Tüm sheet aynı piksel ızgarasında çizilsin; bir karedeki piksel bloğu ile
+  diğerindeki aynı boyutta olmalı.
+- Karakter ÖNDEN görünsün (idle önden, yürüyüş yandan).
+
+ARKA PLAN
+- (A)'daki dama (checkerboard) desenini aynen koru: renkleri TAM OLARAK
+  #FF00FF ve #C000C0, kare boyutu da (A)'daki kadar.
+- DAMA SENİN CETVELİN: bir dama karesi TAM OLARAK 8 karakter pikseli
+  genişliğindedir. Karakterin her piksel bloğu bu ızgaraya oturmalı — blok
+  kenarları dama karelerinin kenarlarıyla hizalı olsun. Karakteri damadan
+  bağımsız, serbest elle çizme.
+- Bu iki magenta tonu karakterin HİÇBİR yerinde kullanılmamalı.
+- Dama tüm görsel boyunca AYNI iki renkte kalsın; gradyan, gölge, vinyet ya da
+  renk kayması EKLEME.
+
+ÇİZİM KURALLARI
+- Gerçek pixel art: her piksel bloğu TEK düz renk, kenarları keskin.
+- Anti-aliasing, yumuşak geçiş, gradyan, bulanıklık ya da yarı saydam piksel YOK.
+- Sınırlı palet (16-24 renk), net koyu kontur.
+- Kolla gövde arasında 1-2 piksellik minik boşluklar bırakma: kol ya gövdeye
+  değsin ya da arada en az 4 piksellik net açıklık olsun.
+- Yer gölgesi, zemin çizgisi ÇİZME.
+
+Çıktıyı PNG olarak ver. JPEG'e çevirme, yeniden sıkıştırma, "enhance"/upscale
+filtresi uygulama.
+```
+
+Gelen dosyada ilk bakılacak şey: **dört kare gerçekten farklı mı?** Aynı çıktıysa yeniden ürettirin — prompt'taki "fark animasyonun kendisi" maddesini daha da vurgulayarak. Kontrol için:
+
+```bash
+python3 tools/pack_sheet.py kareler/kare_*.png -o idle_spritesheet.png --gif on.gif --duration 500
+```
+
+GIF'te hiçbir hareket görünmüyorsa kareler aynıdır.
+
+### 4b. Sıfırdan idle (poz referansı yoksa)
+
+Walk prompt'unun aynısı; yalnızca POZLAR bölümünü değiştirin:
+
+```
+POZLAR (önden görünüm, nötr ayakta duruş)
+Dört kare de aynı duruş. Değişen TEK şey göğüs/omuz hattının yüksekliği —
+nefes alma hissi.
+
+1. kare — Nötr: Referanstaki duruşun birebir aynısı.
+2. kare — Göğüs/omuz hattı 1 piksel yukarıda.
+3. kare — Göğüs/omuz hattı 2 piksel yukarıda (nefesin zirvesi).
+4. kare — Göğüs/omuz hattı 1 piksel yukarıda.
+
+Bunların DIŞINDA hiçbir şey değişmeyecek: ayakların konumu, bacaklar, şort,
+ayakkabılar, kolların X konumu, kafanın boyutu ve konumu, silüetin genişliği —
+hepsi dört karede de TEK PİKSEL bile oynamayacak. Karakteri bütün olarak
+büyütüp küçültme; sadece göğüs/omuz hattı kayacak.
+```
+
+Tuzak şu: "nefes alma" belirsiz tarif edilirse Gemini nefes hissi yerine tüm karakteri büyütüp küçültüyor. Piksel cinsinden kesin talimat şart — hangi hattın kaç piksel kayacağı yazılmalı.
+
+## 5. Karakteri sağa çevirme (önden → yandan)
+
+Uygulama karakter başına iki sprite kümesi kullanıyor: önden `idle`, yandan `walk_right`. Sola yürüyüş ayrı dosya değil, `meta.json`'daki `"flip": true` ile aynadan üretiliyor. Yani gereken tek dönüşüm **önden → sağa bakan**.
+
+Bu adım [3. bölümü](#3-hazır-sheet-üzerinde-karakter-değiştirme-walk-için-önerilen-yol) da düzeltiyor. Orada karakter referansı olarak önden görünüm verilip sağa bakan yürüyüş kareleri isteniyor — yani modelden aynı anda hem döndürmesi hem poz vermesi bekleniyor. Önce sağa bakan tek bir referans üretip 3. bölüme onu vermek yükü ikiye bölüyor.
+
+### Bu prompt neden diğerlerinden farklı yazıldı
+
+Elimizde ölçülmüş kötü bir geçmiş var: Gemini'ye metinle poz tarif etmek üç turda da başarısız oldu, iki sheet arasındaki alfa IoU %100 çıktı — yani model hiçbir şey değiştirmeden referansı aynen geri verdi (bkz. `tools/rig_pose.py`). Başarısızlık biçimi hep aynı: **model çelişki görünce referansa sadakati seçiyor.**
+
+O yüzden burada "sağa çevir" demek yetmiyor. Prompt, "sağa bakıyor"un **gözle sayılabilir işaretlerini** listeliyor — tek göz, tek kulak, üst üste binen omuzlar. Model bunları tek tek üretmek zorunda kalınca "hiçbir şey değiştirmeme" seçeneği kapanıyor.
+
+Yalnız bu listeyi uzatmanın bir bedeli var; burun maddesinin neden çıkarıldığı [aşağıda](#burun-maddesini-prompta-koymayin).
+
+### Ölçülen kabul ölçütü: siluet ne kadar daralmalı
+
+Beş karakterimizin önden ve yandan karelerinden ölçüldü:
+
+| Karakter | Önden | Yandan | Genişlik oranı | Yükseklik oranı |
+| --- | --- | --- | --- | --- |
+| mag | 40×83 | 28×87 | 0.70 | 1.05 |
+| g1 | 39×85 | 28×87 | 0.72 | 1.02 |
+| ael | 38×84 | 28×87 | 0.74 | 1.04 |
+| omerhan | 36×85 | 31×90 | 0.86 | 1.06 |
+| faküs | 37×91 | 38×91 | **1.03** | 1.00 |
+
+Dördünde genişlik **0.70-0.86**'ya düşüyor, yükseklik değişmiyor.
+
+**Ama bu oranı sert bir kapı olarak kullanmayın.** Üstteki dört karakter ince yapılı; dolgun bir karakterde profil derinliği önden genişliğe yaklaşıyor. Ölçüldü: göbekli bir karakterin iki ayrı üretiminde oranlar 0.906 ve 1.000 çıktı, oysa ikisi de gözle bakıldığında kusursuz profildi — tek göz, tek kulak, burun dışarıda. faküs'ün 1.03'ü de aynı sinyalin erken hâliydi (onun "yandan" karesi zaten gerçek profil değil, dörtte üç görünüş).
+
+Yani genişlik oranı bir **tarama** sinyali: 1'in belirgin üstündeyse şüphelen, ama 1'e yakın olması tek başına ret sebebi değil. Gerçekten dönüp dönmediğinin güvenilir ölçütü **yüz**: tek göz mü görünüyor, kulak tek başına mı, burun siluetin dışına çıkmış mı.
+
+### Tek kare değil, iki kare birlikte isteyin
+
+İlk denemede yandan görünüş **ayrı bir üretim** olarak istendi ve sonuç görsel olarak çok iyiydi — profil doğru, kimlik korunmuş, siluet tek parça. Ama ölçünce ölçek kaymıştı:
+
+| | önden | yandan | değişim |
+| --- | --- | --- | --- |
+| toplam boy | 85px | 95px | +%12 |
+| kafa yüksekliği | 36px | 46px | +%28 |
+| kafa / gövde oranı | %42 | %48 | +6 puan |
+
+Gerçek karakterlerimizde bu oran önden-yandan arasında ~2 puan içinde kalıyor (ael %30→%31, mag %37→%38, g1 %41→%39). Altı puan onların üç katı.
+
+Bu kurtarılamaz bir kusur: `meta.json` karakter başına tek `nativeFrameSize` tutuyor, yani idle ile walk aynı ölçekte olmak zorunda. Tüm sprite'ı küçültmek piksel sanatını bozar, kafayı ayrı küçültmek rötuş değil yeniden çizimdir.
+
+Sebep [Düzen bölümünde](#düzen-ızgara-tek-sıra-değil) zaten yazılı olan şey: her üretim karakteri biraz farklı ölçekte çiziyor. Çare de aynı — **iki görünüşü tek görselde istemek.** "Tüm görsel tek piksel ızgarasında çizilsin" kuralı devreye girince tek bir çizim iki farklı ölçek taşıyamıyor.
+
+Düzen 2×2: üst sol önden, üst sağ yandan, alt satır boş (filigran oraya düşsün). Önden kare bir **ölçek çıpası**; işiniz bitince atarsınız, ama üretim sırasında modeli tek ölçeğe bağlayan şey odur.
+
+Ölçüldü — iki kareli düzenle yapılan iki üretim:
+
+| | yükseklik oranı | kafa oranı farkı |
+| --- | --- | --- |
+| ayrı üretim (eski yol) | 1.12 | +6.0 puan |
+| iki kare, 1. deneme | **0.990** | −2.5 puan |
+| iki kare, 2. deneme | **0.991** | +1.4 puan |
+
+Ölçek kayması %12'den %1'e indi ve kafa oranı hedef banda girdi. Düzen değişikliği işini yaptı.
+
+### Burun maddesini prompt'a KOYMAYIN
+
+İlk sürümde "burun silüetin sağ kenarından dışarı çıksın" maddesi vardı. Karakterin burnunu gereksiz büyük ve sivri çizdiriyor — aynı karakterin iki üretimi yan yana konduğunda fark gözle belli. Madde çıkarıldığında profil yine doğru çıkıyor (burun zaten dışarı çıkıyor, çünkü profil çizmek onu gerektiriyor) ve ölçümler de daha iyi: kafa oranı farkı −2.5 yerine +1.4 puan.
+
+Ders genel: **profilin doğal sonucu olan bir şeyi ayrıca istemek, modeli onu abartmaya itiyor.** Tek göz ve tek kulak maddeleri kalabilir — onlar abartılabilir şeyler değil, var ya da yok.
+
+### Prompt
+
+```
+Sana ÖNDEN görünen bir pixel art karakter veriyorum. Aynı karakteri İKİ
+görünüşte, TEK görselde, 2x2 ızgara halinde çiz.
+
+YERLEŞİM
+- Kare canvas (1:1), olabilecek en yüksek çözünürlükte.
+- 2 satır x 2 sütun ızgara.
+  · SOL ÜST  = karakterin ÖNDEN görünüşü (referanstakinin aynısı)
+  · SAĞ ÜST  = aynı karakterin SAĞA bakan görünüşü
+  · ALT SATIRIN İKİ HÜCRESİ DE TAMAMEN BOŞ — oraya hiçbir şey çizme
+- İki kare arasında ve ızgaranın dışında, karaktere ait hiçbir pikselin
+  bulunmadığı boş şeritler bırak. Şerit genişliği bir karenin en az onda biri
+  kadar olsun.
+- Karakterin hiçbir pikseli tuvalin dış kenarına DEĞMESİN.
+- Çerçeve, ayırıcı çizgi, kare numarası, etiket ya da yazı EKLEME.
+
+ÖLÇEK — EN KRİTİK MADDE
+- İki karedeki karakter BİREBİR aynı ölçekte olsun.
+- Kafa yüksekliği, gövde uzunluğu, bacak uzunluğu, gözlük boyutu: ikisinde de
+  AYNI sayıda piksel.
+- Kafa/gövde oranı iki karede aynı kalsın — profilde kafayı büyütme.
+- İki karakterin ayakları AYNI yatay çizgiye otursun, kafa üstleri de aynı
+  hizada olsun.
+- Tüm görsel TEK bir piksel ızgarasında çizilsin; bir karedeki piksel bloğu ile
+  diğerindeki aynı boyutta olmalı.
+
+SOL ÜST KARE — ÖNDEN
+- Referanstaki karakteri olduğu gibi çiz: aynı duruş, aynı ölçek, aynı palet.
+
+SAĞ ÜST KARE — SAĞA BAKAN
+Bu bir kopyalama işi DEĞİL. Kimlik birebir korunacak ama GÖRÜŞ AÇISI değişecek.
+Aşağıdakilerin hepsini tek tek uygula:
+- Yüz profilden görünsün: yalnızca TEK göz görünür (sağdaki), diğer göz kafanın
+  arkasında kalır.
+- Kulak kafanın SOL yarısında, tek başına görünsün.
+- Omuzlar üst üste binsin; iki omuz yan yana DEĞİL, biri diğerinin arkasında.
+- Uzaktaki kol (sol kol) gövdenin arkasında kalsın; ya hiç görünmesin ya da
+  gövdenin solundan az bir kısmı görünsün.
+- Ayaklar SAĞA doğru dönük olsun; ayak uçları sağı göstersin.
+- Karakter sağa YÜRÜMESİN — ayakta, nötr duruşta, iki ayak yere basıyor.
+- Profilde gövde biraz daralır; YÜKSEKLİK ise birebir aynı kalsın.
+
+KİMLİK — BİREBİR TAŞINACAK
+- Saç rengi ve modeli, yüz hatları, gözlük, sakal/bıyık, kıyafet, ayakkabı,
+  aksesuarlar, renk paleti: iki karede de referanstakiyle aynı.
+- Profilden görünmeyen detayı UYDURMA; referansta ne varsa onu yandan çiz.
+- Karakterin vücut oranını değiştirme.
+
+GÖRSELDE BULUNMAYACAKLAR
+- Yer gölgesi, zemin çizgisi, platform, yansıma.
+- Karakterden KOPUK hiçbir parça olmasın; her iki silüet de tek parça olsun.
+
+ARKA PLAN — DAMA DESENİ
+- Şeffaflığı göstermek için dama (checkerboard) deseni kullan; renkleri TAM
+  OLARAK #FF00FF ve #C000C0 olsun.
+- Bu iki magenta tonu karakterin HİÇBİR yerinde kullanılmamalı.
+- DAMA SENİN CETVELİN: bir dama karesi TAM OLARAK 8 karakter pikseli
+  genişliğindedir. Karakterin her piksel bloğu bu ızgaraya oturmalı — blok
+  kenarları dama karelerinin kenarlarıyla hizalı olsun. Karakteri damadan
+  bağımsız, serbest elle çizme.
+- Dama tüm görsel boyunca AYNI iki renkte kalsın: gradyan, gölge, vinyet ya da
+  renk kayması EKLEME.
+
+ÇİZİM KURALLARI
+- Gerçek pixel art: her piksel bloğu TEK düz renk, kenarları keskin.
+- Anti-aliasing, yumuşak geçiş, gradyan, bulanıklık, yumuşak gölge ya da yarı
+  saydam piksel YOK. Blok kenarlarında ara ton olmayacak.
+- Tüm görsel TEK bir piksel ızgarasında çizilsin; blok boyutu her yerde aynı.
+- Sınırlı palet (16-24 renk), net koyu kontur.
+- Uzaktaki kol ve bacağı biraz daha koyu tonda çiz ki hangi uzvun önde olduğu
+  anlaşılsın.
+- Kolla gövde arasında 1-2 piksellik minik boşluklar bırakma: kol ya gövdeye
+  değsin ya da arada en az 4 piksellik net açıklık olsun.
+
+Çıktıyı PNG olarak ver. JPEG'e çevirme, yeniden sıkıştırma, "enhance"/upscale
+ya da keskinleştirme filtresi uygulama.
+```
+
+### Gelen dosyayı işleme
+
+Tek komut — çıkarım, bölme ve kabul ölçümleri birlikte:
+
+```bash
+python3 tools/iki_gorunus.py gemini.png -o _calisma/karakter
+```
+
+`onden.png` ve `yandan.png` yazar, sonra aşağıdaki ölçütleri kendi uygular ve geçmezse hata koduyla döner. Menüden de erişilebilir (`python3 tools/menu.py` → "İki görünüşü ayır").
+
+**`split_sheet --rows 2 --cols 2` KULLANMAYIN.** Bu bir tuzak: `pixelart_extract` boş alt satırı zaten kırpıyor, geriye 1×2 düzen kalıyor ve 2×2 zorlamak her karakteri ortadan ikiye biçiyor (ölçüldü: 53×108 yerine dört adet 75×54). Otomatik bölme doğru sonucu veriyor — `iki_gorunus.py` onu kullanıyor.
+
+Filigran ayrı bir "kare" olarak çıkabiliyor (ölçüldü: 9×9, 29 opak piksel). Araç sayıya değil **boyuta** bakıp en büyük iki bileşeni aldığı için bu kendiliğinden eleniyor.
+
+**Ana karakteri de bu çıktıdan alın.** Eski önden görseli saklayıp yalnızca yandan kareyi almak ölçek çıpasını boşa düşürür — iki sprite yine farklı ölçekte kalır ve `meta.json` tek bir `nativeFrameSize` tuttuğu için karakter uygulamada idle↔walk geçişinde boyut değiştirir.
+
+**Uyum skoru burada yanıltıyor.** Ölçülen iki dosyada `pixelart_extract` %21-45 ve %26 uyum bildirdi — [kabul kriterine](#kabul-kriteri-önce-ölç-sonra-düzenle) göre "yeniden ürettirin" bölgesi. Ama çıktılar gözle temizdi ve iki kareli ölçümlerden de geçtiler. Skorun düşük çıkma sebebi gerçek ama bu iş için zararsız: blok **kenarları** keskin, ancak geniş düz alanların içinde çok yavaş bir gradyan var (bir yüz kesitinde 1759 renk). Gradyan, komşu piksel farklarının dağılımını tek tepeye doğru itiyor ve skoru düşürüyor.
+
+Yani bu bölümde skora değil, **iki kareyi birbirine karşı ölçen sayılara ve göze** bakın.
+
+**2048'lik Gemini çıktılarında periyot 10.24 çıkıyor.** İki dosyada da karakter ızgarası tam olarak 2048/200 = 10.24px oldu. Bir dosyada Y ekseni yanlışlıkla harmonik yakaladı (5.12) ve çıktı dikeyde iki kat gerildi — 52×203 gibi imkânsız bir en-boy oranı. Böyle bir şey görürseniz periyodu elle verin:
+
+```bash
+python3 tools/pixelart_extract.py iki_gorunus.png native.png --period 10.24
+```
+
+Kontrol basit: chibi bir karakterin en-boy oranı ~1:2 olmalı. 1:3.8 çıktıysa eksenlerden biri harmoniğe kilitlenmiştir.
+
+**"Dama senin cetvelin" maddesi tutmuyor.** Ölçüldü: iki dosyada dama kareleri 256px ve 128px, karakter bloğu ise 10.24px — yani "bir dama karesi 8 karakter pikseli" kuralı hiç uygulanmamış. Zarar vermedi (çıkarım yine çalıştı) ama bu maddeye güvenmeyin; hizalamayı sağlayan şey o değil.
+
+### Kontrol listesi
+
+Diğer bölümlerdeki [kabul kriterinin](#kabul-kriteri-önce-ölç-sonra-düzenle) hepsi burada da geçerli. Ek olarak, **iki kareyi birbirine karşı** ölçün:
+
+1. **Yükseklikler eşit mi?** En sert ölçüt bu. İki karenin siluet yüksekliği %1 içinde olmalı (ölçülen iki üretimde 0.990 ve 0.991). Değilse ızgara kuralı tutmamış demektir — yeniden ürettirin, çünkü araçlar ölçek farkını düzeltemez.
+2. **Kafa oranı korunmuş mu?** İki karede kafa/gövde oranı 2-3 puandan fazla ayrılmamalı (ölçülen: −2.5 ve +1.4 puan). Profilde kafa büyürse chibi oranı kayar.
+3. **Tek göz, tek kulak mı?** Gerçekten dönüp dönmediğinin en güvenilir işareti bu. İki göz görünüyorsa dörtte üç görünüş üretmiştir; kullanılabilir ama walk sheet'inde tutarsızlık yaratır.
+4. **Genişlik daraldı mı?** Yardımcı sinyal, sert kapı değil — dolgun karakterlerde oran 1'e yakın çıkabiliyor (ölçüldü: 0.906 ve 1.000, ikisi de doğru profildi). 1'in belirgin üstündeyse şüphelenin.
+5. **Kimlik sızdı mı?** Saç rengi, gözlük, kıyafet iki karede de referanstakiyle aynı mı.
+
+Üçüncü madde için hızlı bir kontrol:
+
+```bash
+python3 tools/skeleton.py kareler/kare_01.png --overlay kontrol.png
+```
+
+Yandan karede `RIGHT SHOULDER` ile `LEFT SHOULDER` arasındaki X farkı, önden karede ölçülenin çok altında kalmalı — omuzlar üst üste bindiği için.
+
+Sonra **sağdaki kareyi** 3. bölümdeki prompt'a **(B) KARAKTER REFERANSI** olarak verin. Soldaki kare işini bitirmiştir; ölçek çıpası olarak görevini üretim sırasında yaptı. Artık model yalnızca poz vermekle uğraşacak, döndürmeyle değil.
+
+## Kabul kriteri: önce ölç, sonra düzenle
+
+**En önemli pratik kural bu.** Ölçüldü: aynı prompt ve aynı referansla yapılan iki üretimden biri 93.2 ızgara skoru aldı, diğeri 1.8. Prompt değişmedi, referans değişmedi — değişen sadece üretim kumasıydı. Yani hiçbir prompt bunu garanti etmiyor; **gelen dosyayı ölçüp kötüyse yeniden ürettirmek** en güvenilir yol.
+
+Ölçüm bir komut:
+
+```bash
+python3 tools/pixelart_extract.py sheet.png native.png
+```
+
+Çıktıdaki `uyum` satırına bakın:
+
+| Uyum | Ne yapmalı |
+| --- | --- |
+| %90+ | Kullanın |
+| %50-90 | Kullanılabilir, ama yüzü/detayı gözle kontrol edin |
+| %50 altı | **Yeniden ürettirin.** Araç zaten "izgara uyumu dusuk" diye uyarır |
+| Hata verir | Yeniden ürettirin |
+
+Yeniden ürettirmek saniyeler sürüyor; bozuk bir sheet'i kurtarmaya çalışmak saatler. Ölçülen bir vakada %17 uyumlu bir idle sheet'i hiçbir yöntemle temiz çıkmadı — `--period`, `--per-frame`, `--like-ref`, farklı örnekleme; hiçbiri kurtarmadı, çünkü karakterin kendisi piksel ızgarasına oturtulmamıştı.
+
+## 6. Üretim sonrası kontrol listesi
+
+Pipeline'a sokmadan önce görsele bakıp şunları doğrulayın:
+
+1. **Görsel ızgara mı, tek uzun sıra mı?** Tek sıra geldiyse yeniden ürettirin — en-boy oranı büyüdükçe görsel yeniden sıkıştırılıp geliyor ve piksel ızgarası bozuluyor (bkz. [Düzen](#düzen-ızgara-tek-sıra-değil)).
+2. **Görsele yakınlaşınca blok kenarları keskin mi?** Bulanıksa yeniden ürettirin; bu, araçların düzeltemediği tek kusur (bkz. [Render keskinliği](#render-keskinliği-kurtarılamayan-tek-kusur)).
+3. **Kareler arasında gerçekten boş şerit var mı?** Yoksa ızgara ölçüsünü elle verin: `split_sheet --rows 2 --cols 4`.
+4. **Kare sayısı ve sırası doğru mu?** Karakter değiştirme yönteminde Gemini bazen kare atlıyor ya da sırayı bozuyor. Izgarada okuma sırası soldan sağa, sonra alt satır.
+5. **Karakter bütün karelerde aynı boyda mı?** Değilse `split_sheet` uyarı verir; düzeltmek için yeniden ürettirmek gerekir, araç ölçekleyemez.
+6. **Yer gölgesi, çerçeve, numara, köşede parıltı var mı?** Varsa yeniden ürettirin — hepsi opak piksel olarak sprite'a karışır.
+7. **Dama gerçekten magenta mı?** Gemini bazen istenen rengi görmezden gelip griye dönüyor. Gri geldiyse çalışır ama beyaz detaylar risk altındadır.
+8. **Karakter değiştirme yaptıysanız:** poz referansındaki karakterin kıyafeti/saç rengi sızmış mı? Gemini iki referansı bazen karıştırıyor.
+
+Sonra araçları çalıştırın — menüden (`python3 tools/menu.py` → 1) ya da elle:
+
+```bash
+python3 tools/pixelart_extract.py sheet_ham.png sheet_native.png --verbose --verify
+```
+
+Çıktıda **önce native çözünürlüğe bakın**: 2048'lik bir canvas'tan 100×100 civarı beklenir. Araç size girdiyle aynı ölçüyü söylüyorsa ("Gorsel zaten native cozunurlukte gorunuyor") indirgeme hiç yapılmamıştır — görsel fazla gürültülüdür, sonuç kullanılamaz.
+
+Sonra `--verify` çıktısındaki `3) Detay kaybi` satırı: çakışan hücre sayısı 0'a yakın olmalı. `4) Kaynak gurultusu` satırındaki palet, temiz bir render'da birkaç yüz renk mertebesinde kalır; on binlere çıkıyorsa kaynak yeniden sıkıştırılmış demektir.
+
+Native çözünürlük beklediğinizden çok küçükse (ör. kare başına 40 pikselden az) Gemini'yi daha büyük canvas'a zorlayın ya da kareleri tek tek ürettirin.
+
+```bash
+python3 tools/split_sheet.py sheet_native.png -o kareler/ --frames 4 --preview bolme.png
+```
+
+```bash
+python3 tools/pack_sheet.py kareler/kare_*.png -o walk_right_spritesheet.png --gif on.gif
+```
+
+`on.gif`'i açın. Titreme varsa `pack_sheet` çıktısındaki örtüşme yüzdelerine bakın: düşük olan kare ya farklı ölçekte üretilmiş ya da pozu diğerlerinden çok farklı.
+
+Sheet'i `characters/` altına yerleştirip `meta.json` yazmak için: [README](README.md#boru-hattı).
+
+---
+
+## 6. İskelet zorlamalı poz sheet'i (walk / özel animasyon)
+
+**Ne zaman:** elinizde bir karakter var ve onu **belirli pozlarda** istiyorsunuz.
+Poz referansını `tools/poz_referans.py` üretir:
+
+```bash
+python3 tools/poz_referans.py characters/ael/walk_right_spritesheet.png \
+    --klip walk_right --kare 4 -o _cikti/ael_poz.png
+```
+
+### Neden metin değil görsel
+
+Ölçüldü (`rig_pose.py`): Gemini'ye pozu **metinle** tarif etmek üç turda da
+başarısız oldu — iki ayrı sheet arasında alfa IoU **%100**, yani model hiçbir
+şeyi değiştirmedi. Teşhis çözümü de söylüyordu: *"metin uzamsal bilgi
+taşımıyor"*. Eksik olan görsel poz referansıydı.
+
+### Renk kodu
+
+| renk | ne |
+| --- | --- |
+| turuncu-kırmızı | karakterin **izleyiciye yakın** tarafındaki uzuvlar |
+| mavi | **uzak** taraftaki uzuvlar |
+| koyu gri | gövde, boyun, kafa dairesi + bakış yönü çizgisi |
+
+Bu kod olmadan model hangi kolun önde olduğunu bilemez ve örtüşmeyi/
+gölgelendirmeyi rastgele kurar.
+
+### Prompt
+
+> You will receive TWO images.
+>
+> **Image 1** is the reference character: a pixel art sprite. This defines
+> identity — palette, clothing, hair, face, body proportions, limb thickness,
+> outline style, shading style. Copy all of it exactly.
+>
+> **Image 2** is a POSE REFERENCE: a 2×2 grid of stick-figure skeletons.
+> It defines ONLY the pose. Colour code:
+> orange-red limbs are on the side of the body NEAREST the viewer,
+> blue limbs are on the FAR side, dark grey is the torso and the head circle,
+> and the short dark line inside the head circle points where the face looks.
+>
+> **Step 1 — analyse before drawing.** For each of the four cells, write one
+> or two sentences describing the pose: which leg is forward, which arm is
+> raised, how the torso is tilted, which limbs are in front and therefore
+> occlude the others, and where the light and shadow should fall as a result.
+> Do this in text first, then draw.
+>
+> **Step 2 — draw.** Produce a 2×2 grid pixel art sheet of the reference
+> character in those four poses, in the same reading order as image 2
+> (top-left, top-right, bottom-left, bottom-right).
+>
+> Hard requirements:
+> - The whole sheet must be drawn on ONE single pixel grid, one consistent
+>   pixel size across all four cells.
+> - The character must be the SAME SCALE in all four cells.
+> - Leave a completely empty band between cells — no frame, no cell number,
+>   no label, no ground shadow, no text anywhere.
+> - Background: a magenta (#FF00FF / #CC00CC) checkerboard, in a colour that
+>   appears nowhere on the character.
+> - Do not let the character touch the outer edge of the canvas; leave a
+>   clear margin.
+> - Block edges must be crisp. Do not anti-alias, do not blur, do not add
+>   noise or texture.
+> - Leave the bottom-right cell EMPTY if you need somewhere to place a
+>   signature or logo.
+>
+> Do not redesign the character. Do not change proportions, palette, or
+> clothing. Only the pose changes.
+
+### Çıktıyı işleme
+
+```bash
+python3 tools/pixelart_extract.py gemini_cikti.png -o _cikti/ham.png
+python3 tools/split_sheet.py _cikti/ham.png --rows 2 --cols 2 -o _cikti/kareler
+python3 tools/pack_sheet.py _cikti/kareler/*.png -o karakter_klip_spritesheet.png
+```
+
+### Pozun tutup tutmadığını ÖLÇÜN
+
+Gözle bakmak yetmez — eski başarısızlık tam olarak "değişmiş gibi görünüyor
+ama değişmemiş" biçimindeydi. Üretilen kareler arasındaki **alfa IoU**'ya
+bakın: %100'e yakınsa model pozu yok saymıştır ve prompt/referans
+değiştirilmelidir.
+
+---
+
+## 7. PixelLab klibini başka karakterlere giydirme
+
+**Ne zaman:** bir karakterin (ör. `ael`) animasyonları PixelLab ile üretildi ve
+aynı klipleri diğer karakterlere de istiyorsunuz. Poz üretimi çözülmüş
+durumda; geriye yalnızca karakter değiştirme kalıyor — Gemini'nin en iyi
+olduğu iş.
+
+### Şerit Gemini'ye HİÇ gitmiyor
+
+PixelLab çıktısı **tek satır şerit** (motorun beklediği biçim). Şeridi
+referans vermek [8:1 en-boy sorununu](#düzen-ızgara-tek-sıra-değil) doğrudan
+tetikler. Çözüm şeklini değiştirmek değil, **referansı önce ızgaraya
+çevirmek** — o zaman girdi de çıktı da ızgara olur ve "düzeni koru" kuralı
+korunur:
+
+```bash
+python3 tools/menu.py      # 7 — Izgara referansı üret
+```
+
+Araç kare sayısına göre düzeni kendisi seçiyor ve **boş hücreleri sona
+koyuyor**: 7 kare → 3×3 (2 boş), 5 kare → 2×3 (1 boş). Sağ alt hücre her
+zaman boş kalır — filigran oraya düşsün diye. Seçtiği ızgara ölçüsünü
+**not edin**, çıkarımda gerekiyor.
+
+### Prompt
+
+> Sana İKİ referans veriyorum:
+>
+> **(A) POZ REFERANSI** — ızgara düzeninde bir sprite sheet. Bu görselde
+> animasyon DOĞRU, karakter YANLIŞ. Buradan yalnızca hareketi alacaksın.
+>
+> **(B) KARAKTER REFERANSI** — çizmeni istediğim karakter. Buradan yalnızca
+> görünümü alacaksın.
+>
+> ---
+>
+> **ADIM 1 — ÇİZMEDEN ÖNCE OKU VE YAZ.**
+>
+> (A)'daki her DOLU hücre için, sırayla, birer cümle yaz:
+> - gövde nasıl eğik, ağırlık hangi ayakta
+> - iki kol nerede, iki bacak nerede
+> - hangi uzuv öne geliyor ve diğerini nasıl örtüyor
+> - karakter yere göre nerede: ayakta mı, çömelmiş mi, oturmuş mu
+> - bir öncekine göre ne değişti (bu bir animasyon, kareler birbirini
+>   izliyor)
+>
+> Sonra (B) için bir cümle yaz: saç rengi ve biçimi, yüz, kıyafet ve
+> renkleri, ayakkabı, aksesuarlar, ve vücut oranı (kafa gövdeye göre ne
+> kadar büyük).
+>
+> Bunları yazdıktan sonra çizmeye başla.
+>
+> ---
+>
+> **ADIM 2 — ÇİZ.**
+>
+> **Düzen — araç bunlara bakıyor, sapma kurtarılamaz:**
+> - (A)'nın ızgara düzenini AYNEN koru: aynı satır ve sütun sayısı.
+> - Okuma sırası: sol üstten sağa, satır bitince alt satırın soluna.
+> - (A)'da BOŞ olan hücreler çıktıda da BOŞ kalacak. Oraya kare ekleme,
+>   kaydırma yapma.
+> - Tüm sheet TEK bir piksel ızgarasında olacak — her hücrede aynı piksel
+>   boyutu.
+> - Karakter TÜM hücrelerde aynı ölçekte. Bir karede büyük bir karede küçük
+>   olmayacak.
+> - Hücreler arasında tamamen boş şerit bırak.
+> - Çerçeve, kare numarası, etiket, yazı, yer gölgesi YOK.
+> - Karakter tuvalin dış kenarına değmesin, çevrede pay bırak.
+>
+> **Hareket — (A)'dan gelecek:**
+> - Her hücrede uzuv açıları, gövde eğimi, kalça ve diz bükülmesi,
+>   ayakların yere göre yüksekliği (A)'daki karşılığıyla aynı olacak.
+> - Hangi karede hangi bacağın/kolun önde olduğu değişmeyecek.
+> - Karakterin taban çizgisi (ayakların değdiği yer) kareler arasında
+>   (A)'daki gibi hareket edecek.
+>
+> **Görünüm — (B)'den gelecek:**
+> - Saç rengi, saç biçimi, yüz hatları, ten rengi, sakal/gözlük, kıyafetin
+>   biçimi ve renkleri, ayakkabı, takı — hepsi (B)'deki gibi.
+> - **VÜCUT ORANLARI (B)'den gelecek.** Kafanın gövdeye oranı, uzuv
+>   kalınlığı, omuz genişliği, toplam boy. (A)'nın karakteri farklı
+>   orandaysa (B)'ninki kazanır — (A)'nın vücut tipini KOPYALAMA.
+> - Kontur kalınlığı ve gölgelendirme biçimi (B)'deki gibi.
+> - Karakteri yeniden tasarlama. Yeni aksesuar ekleme, var olanı çıkarma.
+>
+> **Renk — arka plan ve karakter birbirine karışmamalı:**
+> - Arka plan (A)'daki magenta dama deseninin AYNISI olacak.
+> - Magenta (ve pembe/mor tonları) YALNIZCA arka planda kullanılacak.
+>   Karakterin hiçbir yerinde — teninde, saçında, kıyafetinde, gölgesinde,
+>   konturunda — magenta veya pembe piksel OLMAYACAK.
+> - Karakterin kenarları arka planla karışmasın: yarı saydam piksel,
+>   yumuşak geçiş, gölge halkası kullanma. Karakter ile dama arasındaki
+>   sınır tek pikselde keskin bitecek.
+>
+> **Çizim kalitesi:**
+> - Blok kenarları keskin. Yumuşatma (anti-aliasing), bulanıklık, gradyan,
+>   doku, gürültü ekleme.
+> - Her hücrede aynı palet kullanılacak; kareler arasında renk kayması
+>   olmayacak.
+
+### Neden bu maddeler var — hepsi ölçülmüş bir kusurdan geliyor
+
+| madde | ölçülen kusur |
+| --- | --- |
+| "boş hücreler boş kalacak" | 7 kare 3×3'e sığmıyor, 2 hücre boş; model oraya kare uydurursa `split_sheet` yanlış sayıda kare çıkarır |
+| "oranlar (B)'den" | `ael` chibi (kafa oranı 2.43); bu madde olmadan çıktı `ael`'e benzemeye başlıyor |
+| "magenta yalnızca arka planda" | `faküs` denemesinde karakterin koluna magenta lekeler bulaştı; `pixelart_extract` onları dama sanıp saydam yapıyor ve kolda **delik** kalıyor |
+| "kenarlar keskin, yarı saydam yok" | dama tonları kenar şeridinden öğreniliyor; yumuşak geçiş tolerans ölçümünü bozuyor |
+| "aynı palet" | kareler arası renk kayması `pack_sheet` sonrası titreme olarak görünüyor |
+
+### Çıktıyı işleme
+
+```bash
+python3 tools/menu.py      # 2 — Gemini çıktısını sprite sheet'e çevir
+```
+
+Üç adımı birden koşturuyor (çıkar → böl → hizala) ve ızgara ölçüsünü soruyor;
+1. adımda not aldığınız değeri girin. Tıkanırsa tek tek de koşulabilir:
+**4** (çıkar) → **5** (böl) → **6** (paketle).
+
+Sonra `characters/<ad>/meta.json`'a klip girdisini ekleyin. `frameDuration`
+ve `loop`/`yoyo`/`reverse` alanlarını kaynak karakterin `meta.json`'ından
+**kopyalayın** — o değerler klibe değil HAREKETE ait, karakter değişince
+değişmiyorlar.

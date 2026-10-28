@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Egitim verisi ve egitilmis checkpoint'ler.
+# Gigabaytlarca gorsel; uretim maliyeti PixelLab bakiyesi oldugu icin asil
+# korunmasi gereken sey _data/uretim* ve _data/poz. Ayrintisi: _data/OKU.md
+_data/
+
+# Arac cikti klasorleri (iskelet_rig, comfy_uret, poz_referans ...)
+_cikti/
+
+# Ornek girdiler — Gemini ham ciktilari, repoya girmesi gerekmeyen agirlik
+tools/test/
+
+# Isletim sistemi
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Yerel ortam — PIXELLAB_API_KEY burada
+.env
+.env.local

@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+"""
+skeleton_edit.py — sprite'i surukle, iskeleti otomatik cikar, elle duzelt.
+
+    python3 tools/skeleton_edit.py
+
+NEDEN BU ARAC VAR
+    Otomatik tespitin genel bir garantisi YOK ve olculdu: `skeleton.py`
+    insansi, iki bacakli, bacaklari ayrilan ve ~32 pikselden buyuk figurlerde
+    calisiyor; cubbeli bir karakterde iki ayak tek noktaya cokuyor, dort
+    ayaklida kalca boynun USTUNE cikiyor, 16 piksellik sprite'ta zincir
+    capraziyor.
+
+    Bu bir eksiklik degil, alanin yapisi. Meta'nin CIZIMLER uzerinde egitilmis
+    modeli de "insansi iskelet varsayiyor" deyip insansi olmayan icin elle
+    iskelet tanimi istiyor; PixelLab'in kendi urununde de "edit skeleton"
+    ekrani var. Ciddi her arac otomatik tespiti elle duzeltmeyle esliyor.
+
+TASARIM
+    Bagimlilik yok: sunucu saf standart kutuphane, sayfa tek dosya HTML,
+    sprite base64 olarak icine gomuluyor.
+
+    Sprite tarayiciya SURUKLENIYOR, tespit sunucuda yapiliyor. Boyle olmasinin
+    sebebi tespit algoritmasinin tek yerde kalmasi: JS'te ikinci bir kopya
+    yazilsaydi iki uygulama sessizce birbirinden ayrilirdi.
+
+    Kaydetme geri POST ile geliyor; kullanicinin indirilenler klasorunden
+    dosya tasimasi gerekmiyor.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import http.server
+import glob
+import io
+import json
+import os
+import sys
+import threading
+import webbrowser
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import skeleton as sk  # noqa: E402
+
+
+def en_guncel_model(kok: str) -> str | None:
+    """En yeni URETIM modelini bulur. IKI yere birden bakar.
+
+        models/          depoda, Git LFS ile gelir — KLONLAYANIN elindeki tek
+                         model burasidir
+        _data/modeller/  yerel egitim ciktisi; `_data/` gitignore'da, yani
+                         yalnizca burada egitim yapmis kiside bulunur
+
+    Ikisine birden bakmak sart: yalnizca `_data/` aransaydi klonlayan kisi
+    LFS ile modeli almis olmasina ragmen sezgisele duserdi. Yalnizca
+    `models/` aransaydi, yerel egitim yapan kisi taze modelini goremezdi.
+    Ikisinden EN YENISI seciliyor.
+
+    Neden yalnizca URETIM modelleri: `_data/modeller/` icindeki digerleri
+    OLCUM icin egitildi ve her biri bir karakteri disarida birakiyor
+    (mchen_mag.pt mag'i hic gormedi). Genelleme olcmek icin dogru, kullanmak
+    icin yanlis — elimizdeki veriyi bilerek eksik kullanmis oluruz.
+
+    Uretim modeli yoksa None doner ve cagiran sezgisele duser; sessizce bir
+    olcum modeline dusmek yanlis olurdu."""
+    import glob
+    adaylar = []
+    for dizin in (os.path.join(kok, "models"),
+                  os.path.join(kok, "_data", "modeller")):
+        for p in glob.glob(os.path.join(dizin, "*.pt")):
+            try:
+                import torch
+                k = torch.load(p, map_location="cpu").get("kunye") or {}
+            except Exception:                                      # noqa: BLE001
+                # LFS cekilmemisse dosya birkac yuz baytlik bir ISARETCI olur
+                # ve torch onu acamaz. Sessizce atlamak yanlis olurdu.
+                if os.path.getsize(p) < 4096:
+                    print(f"UYARI: {p} bir Git LFS isaretcisi — model henuz "
+                          f"indirilmemis. `git lfs pull` calistirin.",
+                          file=sys.stderr)
+                continue
+            if k.get("uretim"):
+                adaylar.append((k.get("tarih", ""), os.path.getmtime(p), p))
+    return max(adaylar)[2] if adaylar else None
+
+
+class Tahminci:
+    """Iskeleti kim cikariyor: POZ MODELI, yoksa sezgisel algoritma.
+
+    Model varsayilan, cunku olculdu (dort holdout):
+        skeleton.py  gorulmemis karakterde 13.46px; yandan gorunuste kalcayi
+                     18.6px sasiriyor ve NECK>HIP iki bacak zincirinin de koku
+                     oldugu icin altindaki her sey kayiyor
+        poz modeli   onden 1.51px, yandan 4.06px
+
+    Sezgisel yol yine de duruyor: bagimliliksiz calisiyor ve checkpoint
+    bulunamadiginda tek secenek o. Hangisinin kullanildigi arayuze
+    bildiriliyor — kullanici neye baktigini bilmeli."""
+
+    def __init__(self, ckpt: str | None):
+        self.ad, self._model, self._dev, self._tuval = "sezgisel", None, None, 128
+        if not ckpt:
+            return
+        try:
+            import pose_model as pm
+            import torch
+            d = torch.load(ckpt, map_location="cpu")
+            self._model = pm.PozModeli(d["tuval"], len(sk.LABELS),
+                                       on_egitimli=False, derinlik=d["derinlik"])
+            self._model.load_state_dict(d["model"])
+            self._dev = pm.aygit()
+            self._model.to(self._dev).eval()
+            self._tuval, self._pm = d["tuval"], pm
+            self.ad = "model"
+        except Exception as err:                                  # noqa: BLE001
+            print(f"UYARI: poz modeli yuklenemedi ({err}); sezgisel tahminciye "
+                  f"dusuluyor.", file=sys.stderr)
+
+    # Egitim verisinde siluet yuksekligi medyani 122px, %5 dilimi 91px.
+    # Hedef bunun biraz altina, 100'e konuldu: tam sayi kati zorunlulugu
+    # yuzunden tam 122'ye oturmak mumkun degil ve hedefi yuksek tutmak kucuk
+    # sprite'larda gereksiz buyuk katlar seciyor.
+    HEDEF_SILUET = 100
+
+    def _buyutme_kati(self, kare: np.ndarray) -> int:
+        opak = kare[:, :, 3] > 0
+        ys, _ = np.where(opak)
+        if ys.size == 0:
+            return 1
+        boy = int(ys.max() - ys.min() + 1)
+        if boy <= 0:
+            return 1
+        # ASAGI yuvarlaniyor, yakina degil: hedefi asmak olculdu ve zarar
+        # veriyor. 63px'lik bir siluette round 2 kat secip 126px'e cikariyor
+        # ve hata 2.04'ten 2.90'a yukseliyor; asagi yuvarlayinca 1 katta
+        # kalip 2.04'te kaliyor. Yani "biraz kucuk" "biraz buyuk"ten iyi.
+        return max(1, min(8, int(self.HEDEF_SILUET / boy)))
+
+    def __call__(self, kare: np.ndarray, yon: str) -> sk.Iskelet:
+        if self._model is None:
+            return sk.estimate(kare, direction=yon)
+        import torch
+        import pose_dataset as pdset
+
+        # KUCUK SPRITE'I ONCE BUYUT. `kanvasa_yerlestir` bilerek buyutmuyor —
+        # egitim verisi uretirken dogru karar, cunku pixel art'i buyutmek
+        # sahte ara tonlar uretir. Ama CIKARIMDA tam tersi gerekiyor: model
+        # karakteri egitimde gordugu boyda gormeli.
+        #
+        # Olculdu, ael idle karesi farkli boylarda:
+        #     21px sprite -> 29.18px hata      65px -> 2.04px
+        #     34px        ->  9.01px           87px -> 0.52px
+        #     43px        ->  6.94px          261px -> 3.31px
+        # Egitim verisinde siluet yuksekligi medyani 122px (%5 dilimi 91).
+        # Yani 50 pikselin altindaki bir sprite dagilimin tamamen disinda
+        # kaliyor ve cikti kullanilamaz oluyor. Pixel art genelde 32x32 ya da
+        # 48x48 oldugu icin bu nadir bir durum degil, olagan durum.
+        #
+        # Buyutme TAM SAYI katiyla ve NEAREST ile: ara ton uretmiyor, yalnizca
+        # her pikseli bir bloga ceviriyor. Cikti koordinatlari sonunda ayni
+        # katsayiya bolunerek KAREYE geri tasiniyor.
+        kat = self._buyutme_kati(kare)
+        if kat > 1:
+            from PIL import Image as _I
+            kare = np.array(_I.fromarray(kare).resize(
+                (kare.shape[1] * kat, kare.shape[0] * kat), _I.NEAREST))
+
+        # Model, egitimde gordugu tuvale gore calisiyor: kare ortalanip
+        # `tuval` boyutuna yerlestiriliyor. Donusum degerleri saklaniyor ki
+        # cikti KAREYE geri tasinabilsin.
+        tuval, olcek, dx, dy = pdset.kanvasa_yerlestir(kare, self._tuval)
+        olcek, dx, dy = olcek * kat, dx, dy
+        # Girdi normalizasyonu pose_model.Kume ile BIREBIR ayni olmali.
+        rgb = np.where(tuval[:, :, 3:4] > 0, tuval[:, :, :3], 255).astype(np.float32) / 255.0
+        x = rgb.transpose(2, 0, 1)
+        ort = np.array([0.485, 0.456, 0.406], np.float32).reshape(3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225], np.float32).reshape(3, 1, 1)
+        x = np.ascontiguousarray((x - ort) / std, dtype=np.float32)[None]
+        with torch.no_grad():
+            xl, yl = self._model(torch.from_numpy(x).to(self._dev))
+            px, py = self._pm.koordinat_coz(xl, yl, self._tuval)
+        p = torch.stack([px, py], -1).cpu().numpy()[0]
+        noktalar = {l: ((float(p[i][0]) - dx) / olcek, (float(p[i][1]) - dy) / olcek)
+                    for i, l in enumerate(sk.LABELS)}
+        # olculen/supheli sezgisel algoritmanin kavramlari; modelde karsiligi
+        # yok, o yuzden bos. Arayuz bunlari yalnizca renklendirmede kullaniyor.
+        return sk.Iskelet(noktalar=noktalar, z={}, olculen=frozenset(),
+                          supheli=frozenset())
+
+
+SAYFA = r"""<!doctype html>
+<html lang="tr"><head><meta charset="utf-8">
+<title>Iskelet duzenleyici</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+         background:#14161a; color:#e6e6e6; display:flex; height:100vh; }
+  #sol { flex:1; display:flex; align-items:center; justify-content:center;
+         overflow:auto; position:relative; background:
+           repeating-conic-gradient(#1c1f24 0 25%, #242830 0 50%) 0 0/24px 24px; }
+  #sol.uzerinde::after { content:"birak"; position:absolute; inset:12px;
+         border:2px dashed #4f9dd9; border-radius:10px; display:flex;
+         align-items:center; justify-content:center; font-size:20px;
+         color:#4f9dd9; background:#4f9dd922; pointer-events:none; }
+  canvas { image-rendering:pixelated; cursor:crosshair; }
+  #bosluk { text-align:center; color:#7d8592; padding:40px; max-width:420px; }
+  #bosluk b { color:#c8cdd6; display:block; font-size:15px; margin-bottom:8px; }
+  #yan { width:300px; padding:14px; background:#1a1d22; overflow-y:auto;
+         border-left:1px solid #2b3038; }
+  h1 { font-size:14px; margin:0 0 4px; }
+  .alt { color:#8b93a1; font-size:11px; margin:0 0 12px; word-break:break-all; }
+  button, select, input[type=number] { font:inherit; padding:6px 9px; margin:0 4px 6px 0;
+      cursor:pointer; background:#272c34; color:#e6e6e6; border:1px solid #39404a;
+      border-radius:5px; }
+  button:hover:not(:disabled) { background:#323842; }
+  button:disabled { opacity:.4; cursor:default; }
+  button.ana { background:#2f6f43; border-color:#3d8a55; }
+  label { font-size:11px; color:#8b93a1; display:block; margin:8px 0 2px; }
+  ul { list-style:none; padding:0; margin:10px 0 0; font-size:11px; }
+  li { padding:3px 6px; border-radius:4px; display:flex; justify-content:space-between;
+       cursor:pointer; }
+  li:hover { background:#242932; }
+  li.secili { background:#2f4a6f; }
+  .olculdu { color:#ff6b6b; }  .turetildi { color:#ffd93d; }
+  .supheli { color:#ff8c1a; font-weight:700; }
+  .ipucu { margin-top:14px; font-size:11px; color:#8b93a1; }
+  .ipucu b { color:#c8cdd6; font-weight:600; }
+  #durum { margin-top:8px; font-size:11px; min-height:32px; color:#9fd3a0; }
+  #durum.hata { color:#ff8b8b; }
+</style></head><body>
+<div id="sol">
+  <div id="bosluk"><b>Sprite'i buraya surukle</b>
+    PNG — tek kare ya da yatay serit.<br>Iskelet otomatik cikarilir,
+    sonra eklemleri elle duzeltirsin.<br><br>
+    <button onclick="document.getElementById('dosya').click()">dosya sec</button>
+    <input id="dosya" type="file" accept="image/png,image/*" hidden
+           onchange="dosyaOku(this.files[0])">
+  </div>
+  <canvas id="tuval" hidden></canvas>
+</div>
+<div id="yan">
+  <h1>Iskelet duzenleyici</h1>
+  <p class="alt" id="bilgi">sprite bekleniyor</p>
+
+  <label>Bakis yonu — idle genelde onden, walk yandan</label>
+  <select id="yon" onchange="tespit()">
+    <option value="south">south · one bakan</option>
+    <option value="north">north · sirti donuk</option>
+    <option value="east">east · saga bakan</option>
+    <option value="west">west · sola bakan</option>
+  </select>
+
+  <div id="kare_kutu" hidden>
+    <label>Kare (<span id="kare_say">1</span> kare bulundu)</label>
+    <button onclick="kareGec(-1)">‹ onceki</button>
+    <span id="kare_no">0</span>
+    <button onclick="kareGec(1)">sonraki ›</button>
+  </div>
+
+  <label>Goruntu</label>
+  <button onclick="yakinlik(-2)">− kucult</button>
+  <button onclick="yakinlik(2)">+ buyut</button>
+  <button onclick="tespit()">yeniden tespit</button>
+
+  <div style="margin-top:10px">
+    <button class="ana" id="kaydet_btn" onclick="kaydet()" disabled>Kaydet</button>
+  </div>
+  <div id="gezinme" style="display:none;margin-top:10px">
+    <label>Klasor</label>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button onclick="gez(-1)">‹ onceki</button>
+      <button onclick="gez(1)">sonraki ›</button>
+      <span id="ilerleme" style="color:#9aa4b2"></span>
+    </div>
+    <select id="dosya_sec" style="width:100%;margin-top:6px"
+            onchange="dosyaAc(this.value)"></select>
+  </div>
+  <div id="kayit_yolu" style="margin-top:10px;font-size:11px;color:#7d8592;
+       word-break:break-all"></div>
+  <div id="durum"></div>
+  <ul id="liste"></ul>
+  <p class="ipucu">
+    <b>Surukle</b> eklemi tasir · <b>ok tuslari</b> 1 piksel ·
+    <b>Shift+ok</b> 5 piksel · <b>Tab</b> siradaki eklem.<br><br>
+    Suruklerken hiza cizgileri cikar ve yakinsan kilitler:<br>
+    <span style="color:#ff58d8">▮</span> govde ekseni ·
+    <span style="color:#59e0a0">▮</span> ayna / es eklem ·
+    <span style="color:#7fb2ff">▮</span> baska bir eklem.<br>
+    <b>Alt</b> basili tutarsan kilitleme kapanir.<br><br>
+    <span class="olculdu">■</span> olculdu ·
+    <span class="supheli">■</span> zayif sinyal ·
+    <span class="turetildi">■</span> turetildi<br>
+    Turuncular bu karakterin cizim tarzinda ISARETI OLMAYAN eklemler —
+    once onlari duzelt.
+  </p>
+</div>
+<script>
+const KEMIK = __KEMIK__, LABELS = __LABELS__;
+let durum = null;               // {sprite,w,h,kare,kare_say,noktalar,olculen,ad}
+let olcek = 8, secili = null, suruklenen = null, im = null;
+let kilavuz = [];               // o an gosterilen hiza cizgileri
+const YAPIS = 1.5;              // native piksel — bu kadar yaklasinca kilitlenir
+
+/* Hiza yardimcisi. Iskelette en cok ise yarayan uc hiza var:
+   - ES eklem: omuzlar ayni yukseklikte, kalcalar ayni yukseklikte, gozler
+     ayni hizada olmali. Bunu gozle tutturmak zor, kilit kolay.
+   - AYNA: sag/sol es eklem govde ekseninde simetrik olmali.
+   - GOVDE EKSENI: burun, boyun, kasik hep o dikey cizgide.
+   Alt tusu basiliyken yapisma kapaniyor — bilerek hafif kaydirmak icin. */
+function esNokta(ad) {
+  if (ad.startsWith('RIGHT ')) return 'LEFT ' + ad.slice(6);
+  if (ad.startsWith('LEFT ')) return 'RIGHT ' + ad.slice(5);
+  return null;
+}
+function hizala(ad, x, y, kapali) {
+  const cizgiler = [];
+  if (kapali) return {x, y, cizgiler};
+  const merkez = durum.merkez_x;
+  const es = esNokta(ad), esN = es && durum.noktalar[es];
+
+  let enX = null, dX = YAPIS;
+  const adayX = [];
+  if (merkez != null) adayX.push([merkez, 'merkez']);
+  if (esN) adayX.push([2 * merkez - esN[0], 'ayna']);
+  for (const b of LABELS) if (b !== ad) adayX.push([durum.noktalar[b][0], 'eklem']);
+  for (const [v, tur] of adayX) {
+    if (Math.abs(v - x) < dX) { dX = Math.abs(v - x); enX = [v, tur]; }
+  }
+
+  let enY = null, dY = YAPIS;
+  const adayY = [];
+  if (esN) adayY.push([esN[1], 'es']);
+  for (const b of LABELS) if (b !== ad) adayY.push([durum.noktalar[b][1], 'eklem']);
+  for (const [v, tur] of adayY) {
+    if (Math.abs(v - y) < dY) { dY = Math.abs(v - y); enY = [v, tur]; }
+  }
+
+  if (enX) { x = enX[0]; cizgiler.push(['dikey', x, enX[1]]); }
+  if (enY) { y = enY[0]; cizgiler.push(['yatay', y, enY[1]]); }
+  return {x, y, cizgiler};
+}
+
+const sol = document.getElementById('sol'), tuval = document.getElementById('tuval');
+const ctx = tuval.getContext('2d');
+
+/* ---- sprite alma ---- */
+['dragenter','dragover'].forEach(e => sol.addEventListener(e, ev => {
+  ev.preventDefault(); sol.classList.add('uzerinde'); }));
+['dragleave','drop'].forEach(e => sol.addEventListener(e, ev => {
+  ev.preventDefault(); sol.classList.remove('uzerinde'); }));
+sol.addEventListener('drop', ev => {
+  const f = ev.dataTransfer.files[0];
+  if (f) dosyaOku(f); else bildir('dosya bulunamadi', true);
+});
+function dosyaOku(f) {
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { durum = {sprite: r.result, ad: f.name}; tespit(true); };
+  r.onerror = () => bildir('dosya okunamadi', true);
+  r.readAsDataURL(f);
+}
+
+/* ---- tespit sunucuda ---- */
+async function tespit(yeni = false) {
+  if (!durum || !durum.sprite) return;
+  bildir('tespit ediliyor…');
+  try {
+    const r = await fetch('/detect', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sprite: durum.sprite, ad: durum.ad,
+        yon: document.getElementById('yon').value,
+        kare: yeni ? 0 : (durum.kare || 0)})});
+    const g = await r.json();
+    if (!r.ok) { bildir(g.hata || 'tespit basarisiz', true); return; }
+    durum = Object.assign(durum, g);
+    if (g.kayit) document.getElementById('kayit_yolu').textContent = 'kayit → ' + g.kayit;
+    im = new Image(); im.src = durum.sprite_kare; im.onload = ciz;
+    document.getElementById('kaydet_btn').disabled = false;
+    document.getElementById('bosluk').hidden = true;
+    tuval.hidden = false;
+    document.getElementById('kare_kutu').hidden = durum.kare_say < 2;
+    document.getElementById('kare_say').textContent = durum.kare_say;
+    document.getElementById('kare_no').textContent = durum.kare;
+    document.getElementById('bilgi').textContent =
+      `${durum.ad} · ${durum.w}x${durum.h} · ${durum.olculen.length}/18 olculdu`
+      + ((durum.supheli||[]).length ? ` · ${durum.supheli.length} zayif sinyal` : '');
+    bildir(`hazir — kaydedilecek: ${durum.cikti}`);
+  } catch (e) { bildir(String(e), true); }
+}
+function kareGec(d) {
+  if (!durum) return;
+  durum.kare = Math.max(0, Math.min(durum.kare_say - 1, (durum.kare || 0) + d));
+  tespit();
+}
+let dosyalar = [], dosyaIx = -1;
+
+async function listeYukle() {
+  try {
+    const r = await fetch('/liste', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'});
+    const g = await r.json();
+    document.getElementById('kayit_yolu').textContent = 'kayit → ' + g.kayit;
+    if (!g.klasor || !g.dosyalar.length) return;
+    dosyalar = g.dosyalar;
+    document.getElementById('gezinme').style.display = 'block';
+    const sel = document.getElementById('dosya_sec');
+    sel.innerHTML = '';
+    dosyalar.forEach(d => {
+      const o = document.createElement('option');
+      o.value = d.ad; o.textContent = (d.bitti ? '✓ ' : '  ') + d.ad;
+      sel.appendChild(o);
+    });
+    const kalan = dosyalar.filter(d => !d.bitti);
+    document.getElementById('ilerleme').textContent =
+      `${dosyalar.length - kalan.length}/${dosyalar.length} etiketli`;
+    // Ilk etiketlenmemis kareden basla: kaldigin yerden devam.
+    if (dosyaIx < 0) dosyaAc((kalan[0] || dosyalar[0]).ad);
+  } catch (e) { bildir(String(e), true); }
+}
+
+async function dosyaAc(ad) {
+  dosyaIx = dosyalar.findIndex(d => d.ad === ad);
+  document.getElementById('dosya_sec').value = ad;
+  bildir('yukleniyor…');
+  const r = await fetch('/dosya', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({ad})});
+  const g = await r.json();
+  if (!r.ok) { bildir(g.hata || 'acilamadi', true); return; }
+  durum = {sprite: g.sprite, ad: g.ad};
+  tespit(true);
+}
+
+function gez(d) {
+  if (!dosyalar.length) return;
+  const i = Math.min(dosyalar.length - 1, Math.max(0, dosyaIx + d));
+  dosyaAc(dosyalar[i].ad);
+}
+
+document.addEventListener('keydown', ev => {
+  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
+  if (ev.key === 'ArrowLeft')  { ev.preventDefault(); gez(-1); }
+  if (ev.key === 'ArrowRight') { ev.preventDefault(); gez(1); }
+  if (ev.key === 's' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); kaydet(); }
+});
+
+function bildir(m, hata=false) {
+  const d = document.getElementById('durum');
+  d.textContent = m; d.className = hata ? 'hata' : '';
+}
+
+listeYukle();
+
+/* ---- cizim ---- */
+function ciz() {
+  if (!durum || !im) return;
+  tuval.width = durum.w * olcek; tuval.height = durum.h * olcek;
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0,0,tuval.width,tuval.height);
+  ctx.drawImage(im, 0, 0, tuval.width, tuval.height);
+
+  for (const [yon, v, tur] of kilavuz) {
+    ctx.save();
+    ctx.strokeStyle = tur === 'merkez' ? '#ff58d8'
+                    : (tur === 'ayna' || tur === 'es') ? '#59e0a0' : '#7fb2ff';
+    ctx.lineWidth = 1; ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    if (yon === 'dikey') { ctx.moveTo((v+.5)*olcek, 0); ctx.lineTo((v+.5)*olcek, tuval.height); }
+    else { ctx.moveTo(0, (v+.5)*olcek); ctx.lineTo(tuval.width, (v+.5)*olcek); }
+    ctx.stroke(); ctx.restore();
+  }
+
+  ctx.lineWidth = Math.max(1, olcek/5);
+  ctx.strokeStyle = 'rgba(0,200,255,.75)';
+  for (const [a,b] of KEMIK) {
+    ctx.beginPath();
+    ctx.moveTo((durum.noktalar[a][0]+.5)*olcek, (durum.noktalar[a][1]+.5)*olcek);
+    ctx.lineTo((durum.noktalar[b][0]+.5)*olcek, (durum.noktalar[b][1]+.5)*olcek);
+    ctx.stroke();
+  }
+  for (const ad of LABELS) {
+    const [x,y] = durum.noktalar[ad];
+    const sup = (durum.supheli||[]).includes(ad), oz = durum.olculen.includes(ad);
+    const r = olcek * (ad===secili ? .55 : (sup ? .5 : oz ? .42 : .3));
+    ctx.beginPath(); ctx.arc((x+.5)*olcek, (y+.5)*olcek, r, 0, 7);
+    ctx.fillStyle = sup ? '#ff8c1a' : oz ? '#ff6b6b' : '#ffd93d'; ctx.fill();
+    if (ad === secili) { ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(1,olcek/6); ctx.stroke(); }
+  }
+  listele();
+}
+function listele() {
+  document.getElementById('liste').innerHTML = LABELS.map(a =>
+    `<li class="${a===secili?'secili':''}" onclick="sec('${a}')">
+       <span class="${(durum.supheli||[]).includes(a)?'supheli':durum.olculen.includes(a)?'olculdu':'turetildi'}">${a}</span>
+       <span>${durum.noktalar[a][0].toFixed(1)}, ${durum.noktalar[a][1].toFixed(1)}</span></li>`
+  ).join('');
+}
+function sec(a){ secili = a; ciz(); }
+function yakinlik(d){ olcek = Math.max(2, Math.min(30, olcek+d)); ciz(); }
+
+/* ---- surukle-birak duzenleme ---- */
+function yerel(e) {
+  /* Ekrandaki olcegi VARSAYMIYORUZ, olcuyoruz. Onceki surum dogrudan
+     `olcek`e boluyordu, yani tuvalin ekranda tam olarak w*olcek piksel
+     oldugunu varsayiyordu. Tuval bir flex ogesi ve flex-shrink varsayilan
+     olarak 1 — pencere dar oldugunda CSS onu daraltir, o zaman
+     getBoundingClientRect gercek boyutu dondurur ve varsayim bozulur:
+     tikladigin yerle nokta arasinda kayma olusur. r.width/tuval.width
+     gercek olcegi verir ve CSS ne yaparsa yapsin dogru kalir. */
+  const r = tuval.getBoundingClientRect();
+  const sx = r.width  ? tuval.width  / r.width  : 1;
+  const sy = r.height ? tuval.height / r.height : 1;
+  return [(e.clientX-r.left)*sx/olcek - .5, (e.clientY-r.top)*sy/olcek - .5];
+}
+tuval.addEventListener('mousedown', e => {
+  if (!durum) return;
+  const [x,y] = yerel(e);
+  let iyi=null, d2=1e9;
+  for (const a of LABELS) {
+    const dx=durum.noktalar[a][0]-x, dy=durum.noktalar[a][1]-y, d=dx*dx+dy*dy;
+    if (d<d2) { d2=d; iyi=a; }
+  }
+  if (d2 <= 36) { secili = suruklenen = iyi; ciz(); }
+});
+addEventListener('mousemove', e => {
+  if (!suruklenen) return;
+  const [hx,hy] = yerel(e);
+  const h = hizala(suruklenen, Math.round(hx*2)/2, Math.round(hy*2)/2, e.altKey);
+  durum.noktalar[suruklenen] = [h.x, h.y];
+  kilavuz = h.cizgiler;
+  ciz();
+});
+addEventListener('mouseup', () => { suruklenen = null; kilavuz = []; ciz(); });
+addEventListener('keydown', e => {
+  if (!durum) return;
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    secili = LABELS[(LABELS.indexOf(secili)+1) % LABELS.length]; ciz(); return;
+  }
+  if (!secili) return;
+  const yon = {ArrowLeft:[-1,0], ArrowRight:[1,0], ArrowUp:[0,-1], ArrowDown:[0,1]}[e.key];
+  if (!yon) return;
+  e.preventDefault();
+  const adim = e.shiftKey ? 5 : 1;
+  const p = durum.noktalar[secili];
+  durum.noktalar[secili] = [p[0]+yon[0]*adim, p[1]+yon[1]*adim];
+  ciz();
+});
+
+async function kaydet() {
+  if (!durum) return;
+  bildir('kaydediliyor…');
+  try {
+    const r = await fetch('/save', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({noktalar: durum.noktalar, kare: durum.kare,
+                            ad: durum.ad, w: durum.w, h: durum.h,
+                            yon: document.getElementById('yon').value})});
+    const g = await r.json();
+    bildir(r.ok ? `✓ kaydedildi (${g.sayi} etiket) → ${g.yol}`
+                : (g.hata || 'kaydedilemedi'), !r.ok);
+    if (r.ok && dosyalar.length) {
+      dosyalar[dosyaIx].bitti = true;
+      const sel = document.getElementById('dosya_sec');
+      sel.options[dosyaIx].textContent = '✓ ' + dosyalar[dosyaIx].ad;
+      const bitti = dosyalar.filter(d => d.bitti).length;
+      document.getElementById('ilerleme').textContent =
+        `${bitti}/${dosyalar.length} etiketli`;
+    }
+  } catch (e) { bildir(String(e), true); }
+}
+</script></body></html>
+"""
+
+
+def _kareyi_cikar(rgba: np.ndarray, kare: int, kutu: int | None) -> tuple[np.ndarray, int]:
+    """Yatay seritten kareyi ayirir; (kare, toplam_kare) doner."""
+    k = kutu or rgba.shape[0]
+    if k > 0 and rgba.shape[1] % k == 0 and rgba.shape[1] // k > 1:
+        n = rgba.shape[1] // k
+        kare = max(0, min(n - 1, kare))
+        return rgba[:, kare * k:(kare + 1) * k], n
+    return rgba, 1
+
+
+def _png_datauri(a: np.ndarray) -> str:
+    t = io.BytesIO()
+    Image.fromarray(a).save(t, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(t.getvalue()).decode()
+
+
+class Durum:
+    """Sunucunun tuttugu tek oturumluk durum.
+
+    KAYIT NEREYE GIDIYOR
+
+        Eskiden her kare CALISMA DIZININE ayri bir JSON olarak yaziliyordu
+        (`<ad>_iskelet_<kare>.json`). Arac depo kokunden
+        kostugu icin 36 karelik bir toplu etiketleme depo kokune 36 dosya
+        saciyordu ve nereye gittigi arayuzde gorunmuyordu.
+
+        Artik tek bir JSONL'e yaziliyor ve yol arayuzde yaziyor. Kayit
+        (dosya, kare) anahtarina gore GUNCELLENIYOR: ayni kareyi ikinci kez
+        kaydetmek satiri cogaltmiyor, degistiriyor.
+
+    KALDIGIN YERDEN DEVAM
+        Bir kare acildiginda once KAYITTA aranıyor; varsa modelin tahmini
+        degil SENIN duzeltmen yukleniyor. Bu olmadan bir kareye geri donmek
+        yapilan duzeltmeyi sessizce cope atardi.
+    """
+
+    def __init__(self, cikti: str | None, kutu: int | None,
+                 tahminci: "Tahminci | None" = None,
+                 kayit: str | None = None, klasor: str | None = None):
+        self.cikti = cikti
+        self.kutu = kutu
+        self.z: dict[str, float] = {}
+        self.tahminci = tahminci or Tahminci(None)
+        self.klasor = os.path.abspath(klasor) if klasor else None
+        self.kayit = os.path.abspath(
+            kayit or (os.path.join(self.klasor, "iskeletler.jsonl") if self.klasor
+                      else os.path.join(os.path.dirname(os.path.dirname(
+                          os.path.abspath(__file__))), "_data", "etiketler",
+                          "iskeletler.jsonl")))
+        os.makedirs(os.path.dirname(self.kayit), exist_ok=True)
+
+    # -- kayit dosyasi --------------------------------------------------
+    def kayitlar(self) -> dict[tuple[str, int], dict]:
+        out: dict[tuple[str, int], dict] = {}
+        if not os.path.exists(self.kayit):
+            return out
+        with open(self.kayit) as f:
+            for satir in f:
+                satir = satir.strip()
+                if not satir:
+                    continue
+                try:
+                    r = json.loads(satir)
+                except json.JSONDecodeError:
+                    continue          # yarim yazilmis satir kaydi bosa dusurmesin
+                out[(r.get("dosya", ""), int(r.get("kare", 0)))] = r
+        return out
+
+    def kaydet(self, kayit: dict) -> None:
+        """(dosya, kare) anahtarina gore ekler ya da gunceller.
+
+        Dosya BASTAN yaziliyor, satir eklenmiyor: guncelleme yapabilmek icin
+        baska yol yok ve dosya birkac yuz satirdan buyumeyecek."""
+        hepsi = self.kayitlar()
+        hepsi[(kayit["dosya"], int(kayit["kare"]))] = kayit
+        gecici = self.kayit + ".tmp"
+        with open(gecici, "w") as f:
+            for k in sorted(hepsi):
+                f.write(json.dumps(hepsi[k], ensure_ascii=False) + "\n")
+        os.replace(gecici, self.kayit)      # yarim dosya birakma
+
+    def dosyalar(self) -> list[str]:
+        if not self.klasor:
+            return []
+        return sorted(os.path.basename(y) for y in
+                      glob.glob(os.path.join(self.klasor, "*.png")))
+
+
+def _sunucu(sayfa: str, durum: Durum, port: int, tarayici_ac: bool) -> None:
+    class Islem(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _json(self, kod: int, govde: dict):
+            veri = json.dumps(govde).encode()
+            self.send_response(kod)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(veri)))
+            self.end_headers()
+            self.wfile.write(veri)
+
+        def _govde(self) -> dict:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n)) if n else {}
+
+        def do_GET(self):
+            g = sayfa.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(g)))
+            self.end_headers()
+            self.wfile.write(g)
+
+        def do_POST(self):
+            try:
+                govde = self._govde()
+            except (ValueError, json.JSONDecodeError) as err:
+                self._json(400, {"hata": f"gecersiz istek: {err}"})
+                return
+            if self.path == "/detect":
+                self._detect(govde)
+            elif self.path == "/save":
+                self._save(govde)
+            elif self.path == "/liste":
+                bitmis = {d for d, _ in durum.kayitlar()}
+                self._json(200, {
+                    "klasor": durum.klasor,
+                    "kayit": durum.kayit,
+                    "dosyalar": [{"ad": a, "bitti": a in bitmis}
+                                 for a in durum.dosyalar()]})
+            elif self.path == "/dosya":
+                self._dosya(govde)
+            else:
+                self._json(404, {"hata": "bilinmeyen uc"})
+
+        def _dosya(self, govde: dict):
+            """Klasordeki bir PNG'yi data-URI olarak dondurur.
+
+            Ad yalnizca DOSYA ADI olarak kullaniliyor (`basename`): istemciden
+            gelen bir yolun klasor disina cikmasina izin verilmemeli."""
+            if not durum.klasor:
+                self._json(400, {"hata": "klasor kipi kapali"})
+                return
+            ad = os.path.basename(str(govde.get("ad", "")))
+            yol = os.path.join(durum.klasor, ad)
+            if not ad or not os.path.exists(yol):
+                self._json(404, {"hata": f"dosya yok: {ad}"})
+                return
+            with open(yol, "rb") as f:
+                ham = base64.b64encode(f.read()).decode()
+            self._json(200, {"ad": ad, "sprite": f"data:image/png;base64,{ham}"})
+
+        def _detect(self, govde: dict):
+            try:
+                veri = govde["sprite"].split(",", 1)[1]
+                rgba = np.array(Image.open(io.BytesIO(base64.b64decode(veri)))
+                                .convert("RGBA"))
+            except (KeyError, IndexError, binascii.Error, OSError, ValueError) as err:
+                self._json(400, {"hata": f"gorsel okunamadi: {err}"})
+                return
+            kare, toplam = _kareyi_cikar(rgba, int(govde.get("kare", 0)), durum.kutu)
+            try:
+                isk = durum.tahminci(kare, govde.get("yon", "south"))
+            except ValueError as err:
+                self._json(400, {"hata": str(err)})
+                return
+            # KAYITLI DUZELTME MODELIN TAHMININI EZER. Bir kareye geri
+            # donmek yapilan duzeltmeyi cope atmamali.
+            kayitli = durum.kayitlar().get(
+                (os.path.basename(govde.get("ad", "") or ""), int(govde.get("kare", 0))))
+            yuklendi = False
+            if kayitli and kayitli.get("noktalar"):
+                try:
+                    isk = sk.Iskelet({a: (float(v[0]), float(v[1]))
+                                      for a, v in kayitli["noktalar"].items()},
+                                     dict(isk.z), olculen=frozenset(), supheli=frozenset())
+                    yuklendi = True
+                except (TypeError, ValueError, KeyError):
+                    pass
+            durum.z = {a: float(v) for a, v in isk.z.items()}
+            # Govde ekseni: siluet kutusunun ortasi. Hiza kilavuzu bunu
+            # "merkez" cizgisi ve ayna ekseni olarak kullaniyor.
+            xs = np.where((kare[:, :, 3] > 0).any(axis=0))[0]
+            merkez = float((int(xs.min()) + int(xs.max())) / 2.0) if xs.size else None
+            self._json(200, {
+                "sprite_kare": _png_datauri(kare),
+                "merkez_x": merkez,
+                "w": int(kare.shape[1]), "h": int(kare.shape[0]),
+                "kare": int(govde.get("kare", 0)), "kare_say": int(toplam),
+                "olculen": sorted(isk.olculen),
+                "supheli": sorted(isk.supheli),
+                "noktalar": {a: [round(float(x), 1), round(float(y), 1)]
+                             for a, (x, y) in isk.noktalar.items()},
+                "kayit": durum.kayit,
+                "yuklendi": yuklendi,
+                "tahminci": durum.tahminci.ad,
+            })
+
+        def _save(self, govde: dict):
+            try:
+                ham = govde["noktalar"]
+                isk = sk.Iskelet({a: (float(v[0]), float(v[1])) for a, v in ham.items()},
+                                 dict(durum.z))
+            except (KeyError, TypeError, ValueError) as err:
+                self._json(400, {"hata": f"iskelet gecersiz: {err}"})
+                return
+            ad = os.path.basename(govde.get("ad", "") or "iskelet")
+            kare = int(govde.get("kare", 0))
+            # `keypoints` PixelLab konvansiyonunda, yani 0-1 NORMALIZE.
+            # `to_pixellab()` piksel veriyor; boldurmezsek ayni dosyada iki
+            # farkli birim olusuyor (toplu etiketleyici normalize yaziyor) ve
+            # okuyan taraf sessizce yanlis olcekte poz kuruyor.
+            w = float(govde.get("w") or 0) or 1.0
+            h = float(govde.get("h") or 0) or 1.0
+            kp_n = [dict(k, x=k["x"] / w, y=k["y"] / h) for k in isk.to_pixellab()]
+            # Yon DOSYA ADINDAN turetiliyor; acilir listeye guvenmek yanlisti —
+            # varsayilanda kalinca 18 kare "south" olarak kaydedildi, oysa
+            # iceride dort yon vardi.
+            yon = next((y for y in ("north-east", "north-west", "south-east",
+                                    "south-west", "north", "south", "east", "west")
+                        if f"_{y}_" in ad), govde.get("yon", "south"))
+            try:
+                durum.kaydet({
+                    "dosya": ad, "kare": kare,
+                    "yon": yon,
+                    "keypoints": kp_n,
+                    "noktalar": {a: [round(float(x), 2), round(float(y), 2)]
+                                 for a, (x, y) in isk.noktalar.items()},
+                    "elle": True,
+                })
+            except OSError as err:
+                self._json(400, {"hata": f"yazilamadi: {err}"})
+                return
+            n = len(durum.kayitlar())
+            print(f"Kaydedildi: {ad} kare {kare} -> {durum.kayit}  ({n} etiket)")
+            self._json(200, {"yol": durum.kayit, "sayi": n})
+
+    srv = http.server.HTTPServer(("127.0.0.1", port), Islem)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    print(f"Iskelet duzenleyici: {url}")
+    print("Sprite'i pencereye surukle. Kapatmak icin Ctrl-C.")
+    if tarayici_ac:
+        webbrowser.open(url)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\nKapatildi.")
+    srv.shutdown()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description="Sprite'i surukle, iskeleti otomatik cikar, elle duzelt.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Ornek:\n  python3 tools/skeleton_edit.py")
+    p.add_argument("-o", "--output", default=None,
+                   help="Cikti JSON. Verilmezse sprite adindan turetilir.")
+    p.add_argument("--frame-size", type=int, default=None,
+                   help="Kare kutusu (varsayilan: goruntu yuksekligi)")
+    p.add_argument("--model", default=None,
+                   help="Poz modeli checkpoint'i. Verilmezse VARSAYILAN "
+                        "aranir; o da yoksa sezgisel algoritmaya dusulur.")
+    p.add_argument("--sezgisel", action="store_true",
+                   help="Modeli hic kullanma. Olculdu: sezgisel tahminci "
+                        "gorulmemis karakterde 13.46px, model 1.51-4.06px.")
+    p.add_argument("--klasor", default=None,
+                   help="PNG klasoru. Verilirse arayuzde ileri/geri gezinme "
+                        "acilir ve kaydedilmis kareler isaretlenir.")
+    p.add_argument("--kayit", default=None,
+                   help="Etiket JSONL'i. Varsayilan: klasor icinde "
+                        "iskeletler.jsonl, klasorsuz modda _data/etiketler/.")
+    p.add_argument("--port", type=int, default=0, help="0 = bos port secilir")
+    p.add_argument("--no-open", action="store_true",
+                   help="Tarayiciyi kendiliginden acma")
+    args = p.parse_args(argv)
+
+    sayfa = (SAYFA
+             .replace("__KEMIK__", json.dumps([list(k) for k in sk.KEMIKLER]))
+             .replace("__LABELS__", json.dumps(list(sk.LABELS))))
+    kok_proje = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ckpt = None if args.sezgisel else (args.model or en_guncel_model(kok_proje))
+    tahminci = Tahminci(ckpt)
+    if tahminci.ad == "model":
+        print(f"Iskelet tahmincisi: MODEL  ({os.path.basename(ckpt)})")
+    else:
+        print("Iskelet tahmincisi: SEZGISEL — uretim modeli bulunamadi.\n"
+              "  Egitmek icin: ~/ComfyUI/venv/bin/python tools/pose_model.py "
+              "train _data/karisik_yan --holdout yok \\\n"
+              "                 --ckpt _data/modeller/uretim.pt")
+    if args.klasor and not os.path.isdir(args.klasor):
+        raise SystemExit(f"HATA: klasor yok: {args.klasor}")
+    _sunucu(sayfa, Durum(args.output, args.frame_size, tahminci,
+                         args.kayit, args.klasor),
+            args.port, not args.no_open)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
